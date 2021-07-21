@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli/v2"
 
-	"github.com/aquasecurity/trivy/pkg/commands/config"
+	"github.com/aquasecurity/trivy/pkg/commands/option"
 	"github.com/aquasecurity/trivy/pkg/commands/server"
 )
 
@@ -20,15 +20,15 @@ func TestNew(t *testing.T) {
 	}{
 		{
 			name: "happy path",
-			args: []string{"-quiet", "--no-progress", "--reset", "--skip-update", "--listen", "localhost:8080"},
+			args: []string{"-quiet", "--no-progress", "--reset", "--skip-db-update", "--listen", "localhost:8080"},
 			want: server.Config{
-				GlobalConfig: config.GlobalConfig{
+				GlobalOption: option.GlobalOption{
 					Quiet: true,
 				},
-				DBConfig: config.DBConfig{
-					Reset:      true,
-					SkipUpdate: true,
-					NoProgress: true,
+				DBOption: option.DBOption{
+					Reset:        true,
+					SkipDBUpdate: true,
+					NoProgress:   true,
 				},
 				Listen: "localhost:8080",
 			},
@@ -41,17 +41,17 @@ func TestNew(t *testing.T) {
 			set.Bool("quiet", false, "")
 			set.Bool("no-progress", false, "")
 			set.Bool("reset", false, "")
-			set.Bool("skip-update", false, "")
+			set.Bool("skip-db-update", false, "")
 			set.String("listen", "", "")
 
 			ctx := cli.NewContext(app, set, nil)
 			_ = set.Parse(tt.args)
 
-			tt.want.GlobalConfig.Context = ctx
+			tt.want.GlobalOption.Context = ctx
 
 			got := server.NewConfig(ctx)
-			assert.Equal(t, tt.want.GlobalConfig.Quiet, got.Quiet, tt.name)
-			assert.Equal(t, tt.want.DBConfig, got.DBConfig, tt.name)
+			assert.Equal(t, tt.want.GlobalOption.Quiet, got.Quiet, tt.name)
+			assert.Equal(t, tt.want.DBOption, got.DBOption, tt.name)
 			assert.Equal(t, tt.want.Listen, got.Listen, tt.name)
 		})
 	}
@@ -60,8 +60,8 @@ func TestNew(t *testing.T) {
 func TestConfig_Init(t *testing.T) {
 	tests := []struct {
 		name         string
-		globalConfig config.GlobalConfig
-		dbConfig     config.DBConfig
+		globalConfig option.GlobalOption
+		dbConfig     option.DBOption
 		args         []string
 		wantErr      string
 	}{
@@ -71,25 +71,25 @@ func TestConfig_Init(t *testing.T) {
 		},
 		{
 			name: "happy path: reset",
-			dbConfig: config.DBConfig{
+			dbConfig: option.DBOption{
 				Reset: true,
 			},
 			args: []string{"alpine:3.10"},
 		},
 		{
 			name: "sad: skip and download db",
-			dbConfig: config.DBConfig{
-				SkipUpdate:     true,
+			dbConfig: option.DBOption{
+				SkipDBUpdate:   true,
 				DownloadDBOnly: true,
 			},
 			args:    []string{"alpine:3.10"},
-			wantErr: "--skip-update and --download-db-only options can not be specified both",
+			wantErr: "--skip-db-update and --download-db-only options can not be specified both",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &server.Config{
-				DBConfig: tt.dbConfig,
+				DBOption: tt.dbConfig,
 			}
 
 			err := c.Init()

@@ -13,6 +13,7 @@ import (
 	"github.com/aquasecurity/fanal/cache"
 	"github.com/aquasecurity/trivy/pkg/db"
 	"github.com/aquasecurity/trivy/pkg/log"
+	"github.com/aquasecurity/trivy/pkg/policy"
 	"github.com/aquasecurity/trivy/pkg/utils"
 )
 
@@ -51,8 +52,8 @@ func (c Cache) Reset() (err error) {
 	if err := c.ClearDB(); err != nil {
 		return xerrors.Errorf("failed to clear the database: %w", err)
 	}
-	if err := c.ClearImages(); err != nil {
-		return xerrors.Errorf("failed to clear the image cache: %w", err)
+	if err := c.ClearArtifacts(); err != nil {
+		return xerrors.Errorf("failed to clear the artifact cache: %w", err)
 	}
 	return nil
 }
@@ -66,9 +67,9 @@ func (c Cache) ClearDB() (err error) {
 	return nil
 }
 
-// ClearImages clears the cache images
-func (c Cache) ClearImages() error {
-	log.Logger.Info("Removing image caches...")
+// ClearArtifacts clears the artifact cache
+func (c Cache) ClearArtifacts() error {
+	log.Logger.Info("Removing artifact caches...")
 	if err := c.Clear(); err != nil {
 		return xerrors.Errorf("failed to remove the cache: %w", err)
 	}
@@ -96,10 +97,44 @@ func DownloadDB(appVersion, cacheDir string, quiet, light, skipUpdate bool) erro
 	}
 
 	// for debug
-	if err := showDBInfo(cacheDir); err != nil {
+	if err = showDBInfo(cacheDir); err != nil {
 		return xerrors.Errorf("failed to show database info: %w", err)
 	}
 	return nil
+}
+
+// InitBuiltinPolicies downloads the built-in policies and loads them
+func InitBuiltinPolicies(ctx context.Context, skipUpdate bool) ([]string, error) {
+	client, err := policy.NewClient()
+	if err != nil {
+		return nil, xerrors.Errorf("policy client error: %w", err)
+	}
+
+	needsUpdate := false
+	if !skipUpdate {
+		needsUpdate, err = client.NeedsUpdate()
+		if err != nil {
+			return nil, xerrors.Errorf("unable to check if built-in policies need to be updated: %w", err)
+		}
+	}
+
+	if needsUpdate {
+		log.Logger.Info("Need to update the built-in policies")
+		log.Logger.Info("Downloading the built-in policies...")
+		if err = client.DownloadBuiltinPolicies(ctx); err != nil {
+			return nil, xerrors.Errorf("failed to download built-in policies: %w", err)
+		}
+	}
+
+	policyPaths, err := client.LoadBuiltinPolicies()
+	if err != nil {
+		if skipUpdate {
+			log.Logger.Info("No built-in policies were loaded")
+			return nil, nil
+		}
+		return nil, xerrors.Errorf("policy load error: %w", err)
+	}
+	return policyPaths, nil
 }
 
 func showDBInfo(cacheDir string) error {

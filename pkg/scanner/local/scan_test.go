@@ -4,19 +4,15 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/aquasecurity/fanal/analyzer/library"
-
-	"github.com/aquasecurity/trivy-db/pkg/db"
-
-	"github.com/aquasecurity/trivy/pkg/dbtest"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/aquasecurity/fanal/analyzer"
 	ftypes "github.com/aquasecurity/fanal/types"
 	dtypes "github.com/aquasecurity/go-dep-parser/pkg/types"
+	"github.com/aquasecurity/trivy-db/pkg/db"
 	"github.com/aquasecurity/trivy-db/pkg/vulnsrc/vulnerability"
+	"github.com/aquasecurity/trivy/pkg/dbtest"
 	ospkgDetector "github.com/aquasecurity/trivy/pkg/detector/ospkg"
 	"github.com/aquasecurity/trivy/pkg/report"
 	"github.com/aquasecurity/trivy/pkg/types"
@@ -44,7 +40,10 @@ func TestScanner_Scan(t *testing.T) {
 			args: args{
 				target:   "alpine:latest",
 				layerIDs: []string{"sha256:5216338b40a7b96416b8b9858974bbe4acc3096ee60acbc4dfb1ee02aecceb10"},
-				options:  types.ScanOptions{VulnType: []string{"os", "library"}},
+				options: types.ScanOptions{
+					VulnType:       []string{types.VulnTypeOS, types.VulnTypeLibrary},
+					SecurityChecks: []string{types.SecurityCheckVulnerability},
+				},
 			},
 			fixtures: []string{"testdata/fixtures/happy.yaml"},
 			applyLayersExpectation: ApplierApplyLayersExpectation{
@@ -68,7 +67,7 @@ func TestScanner_Scan(t *testing.T) {
 						},
 						Applications: []ftypes.Application{
 							{
-								Type:     library.Bundler,
+								Type:     ftypes.Bundler,
 								FilePath: "/app/Gemfile.lock",
 								Libraries: []ftypes.LibraryInfo{
 									{
@@ -128,7 +127,8 @@ func TestScanner_Scan(t *testing.T) {
 							},
 						},
 					},
-					Type: vulnerability.Alpine,
+					Class: report.ClassOSPkg,
+					Type:  vulnerability.Alpine,
 				},
 				{
 					Target: "/app/Gemfile.lock",
@@ -143,7 +143,8 @@ func TestScanner_Scan(t *testing.T) {
 							},
 						},
 					},
-					Type: "bundler",
+					Class: report.ClassLangPkg,
+					Type:  ftypes.Bundler,
 				},
 			},
 			wantOS: &ftypes.OS{
@@ -156,7 +157,11 @@ func TestScanner_Scan(t *testing.T) {
 			args: args{
 				target:   "alpine:latest",
 				layerIDs: []string{"sha256:5216338b40a7b96416b8b9858974bbe4acc3096ee60acbc4dfb1ee02aecceb10"},
-				options:  types.ScanOptions{VulnType: []string{"os", "library"}, ListAllPackages: true},
+				options: types.ScanOptions{
+					VulnType:        []string{types.VulnTypeOS, types.VulnTypeLibrary},
+					SecurityChecks:  []string{types.SecurityCheckVulnerability},
+					ListAllPackages: true,
+				},
 			},
 			fixtures: []string{"testdata/fixtures/happy.yaml"},
 			applyLayersExpectation: ApplierApplyLayersExpectation{
@@ -270,7 +275,8 @@ func TestScanner_Scan(t *testing.T) {
 							},
 						},
 					},
-					Type: vulnerability.Alpine,
+					Class: report.ClassOSPkg,
+					Type:  vulnerability.Alpine,
 				},
 				{
 					Target: "/app/Gemfile.lock",
@@ -294,7 +300,8 @@ func TestScanner_Scan(t *testing.T) {
 							},
 						},
 					},
-					Type: "bundler",
+					Class: report.ClassLangPkg,
+					Type:  ftypes.Bundler,
 				},
 			},
 			wantOS: &ftypes.OS{
@@ -307,7 +314,10 @@ func TestScanner_Scan(t *testing.T) {
 			args: args{
 				target:   "alpine:latest",
 				layerIDs: []string{"sha256:5216338b40a7b96416b8b9858974bbe4acc3096ee60acbc4dfb1ee02aecceb10"},
-				options:  types.ScanOptions{VulnType: []string{"os", "library"}},
+				options: types.ScanOptions{
+					VulnType:       []string{types.VulnTypeOS, types.VulnTypeLibrary},
+					SecurityChecks: []string{types.SecurityCheckVulnerability},
+				},
 			},
 			fixtures: []string{"testdata/fixtures/happy.yaml"},
 			applyLayersExpectation: ApplierApplyLayersExpectation{
@@ -348,7 +358,8 @@ func TestScanner_Scan(t *testing.T) {
 							},
 						},
 					},
-					Type: "bundler",
+					Class: report.ClassLangPkg,
+					Type:  "bundler",
 				},
 			},
 			wantOS: &ftypes.OS{},
@@ -358,7 +369,10 @@ func TestScanner_Scan(t *testing.T) {
 			args: args{
 				target:   "alpine:latest",
 				layerIDs: []string{"sha256:5216338b40a7b96416b8b9858974bbe4acc3096ee60acbc4dfb1ee02aecceb10"},
-				options:  types.ScanOptions{VulnType: []string{"os", "library"}},
+				options: types.ScanOptions{
+					VulnType:       []string{types.VulnTypeOS, types.VulnTypeLibrary},
+					SecurityChecks: []string{types.SecurityCheckVulnerability},
+				},
 			},
 			fixtures: []string{"testdata/fixtures/happy.yaml"},
 			applyLayersExpectation: ApplierApplyLayersExpectation{
@@ -403,6 +417,7 @@ func TestScanner_Scan(t *testing.T) {
 			wantResults: report.Results{
 				{
 					Target: "alpine:latest (alpine 3.11)",
+					Class:  report.ClassOSPkg,
 					Type:   vulnerability.Alpine,
 				},
 				{
@@ -418,7 +433,8 @@ func TestScanner_Scan(t *testing.T) {
 							},
 						},
 					},
-					Type: "bundler",
+					Class: report.ClassLangPkg,
+					Type:  "bundler",
 				},
 			},
 			wantOS: &ftypes.OS{
@@ -431,7 +447,10 @@ func TestScanner_Scan(t *testing.T) {
 			args: args{
 				target:   "fedora:27",
 				layerIDs: []string{"sha256:5216338b40a7b96416b8b9858974bbe4acc3096ee60acbc4dfb1ee02aecceb10"},
-				options:  types.ScanOptions{VulnType: []string{"os", "library"}},
+				options: types.ScanOptions{
+					VulnType:       []string{types.VulnTypeOS, types.VulnTypeLibrary},
+					SecurityChecks: []string{types.SecurityCheckVulnerability},
+				},
 			},
 			fixtures: []string{"testdata/fixtures/happy.yaml"},
 			applyLayersExpectation: ApplierApplyLayersExpectation{
@@ -486,7 +505,8 @@ func TestScanner_Scan(t *testing.T) {
 							},
 						},
 					},
-					Type: "bundler",
+					Class: report.ClassLangPkg,
+					Type:  ftypes.Bundler,
 				},
 			},
 			wantOS: &ftypes.OS{
@@ -499,7 +519,10 @@ func TestScanner_Scan(t *testing.T) {
 			args: args{
 				target:   "busybox:latest",
 				layerIDs: []string{"sha256:a6d503001157aedc826853f9b67f26d35966221b158bff03849868ae4a821116"},
-				options:  types.ScanOptions{VulnType: []string{"os", "library"}},
+				options: types.ScanOptions{
+					VulnType:       []string{types.VulnTypeOS, types.VulnTypeLibrary},
+					SecurityChecks: []string{types.SecurityCheckVulnerability},
+				},
 			},
 			fixtures: []string{"testdata/fixtures/happy.yaml"},
 			applyLayersExpectation: ApplierApplyLayersExpectation{
@@ -521,7 +544,10 @@ func TestScanner_Scan(t *testing.T) {
 			args: args{
 				target:   "alpine:latest",
 				layerIDs: []string{"sha256:5216338b40a7b96416b8b9858974bbe4acc3096ee60acbc4dfb1ee02aecceb10"},
-				options:  types.ScanOptions{VulnType: []string{"library"}},
+				options: types.ScanOptions{
+					VulnType:       []string{types.VulnTypeLibrary},
+					SecurityChecks: []string{types.SecurityCheckVulnerability},
+				},
 			},
 			fixtures: []string{"testdata/fixtures/happy.yaml"},
 			applyLayersExpectation: ApplierApplyLayersExpectation{
@@ -580,7 +606,8 @@ func TestScanner_Scan(t *testing.T) {
 							},
 						},
 					},
-					Type: "bundler",
+					Class: report.ClassLangPkg,
+					Type:  ftypes.Bundler,
 				},
 				{
 					Target: "/app/composer-lock.json",
@@ -595,7 +622,8 @@ func TestScanner_Scan(t *testing.T) {
 							},
 						},
 					},
-					Type: "composer",
+					Class: report.ClassLangPkg,
+					Type:  ftypes.Composer,
 				},
 			},
 			wantOS: &ftypes.OS{
@@ -609,8 +637,9 @@ func TestScanner_Scan(t *testing.T) {
 				target:   "alpine:latest",
 				layerIDs: []string{"sha256:5216338b40a7b96416b8b9858974bbe4acc3096ee60acbc4dfb1ee02aecceb10"},
 				options: types.ScanOptions{
-					VulnType: []string{"library"},
-					SkipDirs: []string{"/usr/lib/ruby/gems"},
+					VulnType:       []string{types.VulnTypeLibrary},
+					SecurityChecks: []string{types.SecurityCheckVulnerability, types.SecurityCheckConfig},
+					SkipDirs:       []string{"/usr/lib/ruby/gems", "/app/k8s"},
 				},
 			},
 			fixtures: []string{"testdata/fixtures/happy.yaml"},
@@ -653,6 +682,18 @@ func TestScanner_Scan(t *testing.T) {
 								},
 							},
 						},
+						Misconfigurations: []ftypes.Misconfiguration{
+							{
+								FileType: ftypes.Kubernetes,
+								FilePath: "/app/k8s/deployment.yaml",
+								Failures: ftypes.MisconfResults{
+									{
+										Namespace: "appshield.kubernetes.id100",
+										Message:   "something bad",
+									},
+								},
+							},
+						},
 					},
 				},
 			},
@@ -670,7 +711,8 @@ func TestScanner_Scan(t *testing.T) {
 							},
 						},
 					},
-					Type: "composer",
+					Class: report.ClassLangPkg,
+					Type:  ftypes.Composer,
 				},
 			},
 			wantOS: &ftypes.OS{
@@ -679,11 +721,163 @@ func TestScanner_Scan(t *testing.T) {
 			},
 		},
 		{
+			name: "happy path with misconfigurations",
+			args: args{
+				target:   "/app/configs",
+				layerIDs: []string{"sha256:5216338b40a7b96416b8b9858974bbe4acc3096ee60acbc4dfb1ee02aecceb10"},
+				options: types.ScanOptions{
+					SecurityChecks: []string{types.SecurityCheckConfig},
+				},
+			},
+			fixtures: []string{"testdata/fixtures/happy.yaml"},
+			applyLayersExpectation: ApplierApplyLayersExpectation{
+				Args: ApplierApplyLayersArgs{
+					BlobIDs: []string{"sha256:5216338b40a7b96416b8b9858974bbe4acc3096ee60acbc4dfb1ee02aecceb10"},
+				},
+				Returns: ApplierApplyLayersReturns{
+					Detail: ftypes.ArtifactDetail{
+						Misconfigurations: []ftypes.Misconfiguration{
+							{
+								FileType: ftypes.Kubernetes,
+								FilePath: "/app/configs/pod.yaml",
+								Warnings: []ftypes.MisconfResult{
+									{
+										Namespace: "main.kubernetes.id300",
+										PolicyMetadata: ftypes.PolicyMetadata{
+											ID:       "ID300",
+											Type:     "Kubernetes Security Check",
+											Title:    "Bad Deployment",
+											Severity: "DUMMY",
+										},
+									},
+								},
+								Exceptions: ftypes.MisconfResults{
+									{
+										Namespace: "main.kubernetes.id100",
+										PolicyMetadata: ftypes.PolicyMetadata{
+											ID:       "ID100",
+											Type:     "Kubernetes Security Check",
+											Title:    "Bad Deployment",
+											Severity: "HIGH",
+										},
+									},
+								},
+								Layer: ftypes.Layer{
+									DiffID: "sha256:9922bc15eeefe1637b803ef2106f178152ce19a391f24aec838cbe2e48e73303",
+								},
+							},
+							{
+								FileType: ftypes.Kubernetes,
+								FilePath: "/app/configs/deployment.yaml",
+								Successes: []ftypes.MisconfResult{
+									{
+										Namespace: "appshield.kubernetes.id200",
+										PolicyMetadata: ftypes.PolicyMetadata{
+											ID:       "ID200",
+											Type:     "Kubernetes Security Check",
+											Title:    "Bad Deployment",
+											Severity: "MEDIUM",
+										},
+									},
+								},
+								Failures: ftypes.MisconfResults{
+									{
+										Namespace: "main.kubernetes.id100",
+										Message:   "something bad",
+										PolicyMetadata: ftypes.PolicyMetadata{
+											ID:       "ID100",
+											Type:     "Kubernetes Security Check",
+											Title:    "Bad Deployment",
+											Severity: "HIGH",
+										},
+									},
+								},
+								Layer: ftypes.Layer{
+									DiffID: "sha256:9922bc15eeefe1637b803ef2106f178152ce19a391f24aec838cbe2e48e73303",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantResults: report.Results{
+				{
+					Target: "/app/configs/deployment.yaml",
+					Class:  report.ClassConfig,
+					Type:   ftypes.Kubernetes,
+					Misconfigurations: []types.DetectedMisconfiguration{
+						{
+							Type:      "Kubernetes Security Check",
+							ID:        "ID100",
+							Title:     "Bad Deployment",
+							Message:   "something bad",
+							Namespace: "main.kubernetes.id100",
+							Severity:  "HIGH",
+							Status:    types.StatusFailure,
+							Layer: ftypes.Layer{
+								DiffID: "sha256:9922bc15eeefe1637b803ef2106f178152ce19a391f24aec838cbe2e48e73303",
+							},
+						},
+						{
+							Type:       "Kubernetes Security Check",
+							ID:         "ID200",
+							Title:      "Bad Deployment",
+							Message:    "No issues found",
+							Namespace:  "appshield.kubernetes.id200",
+							Severity:   "MEDIUM",
+							PrimaryURL: "https://avd.aquasec.com/appshield/id200",
+							References: []string{
+								"https://avd.aquasec.com/appshield/id200",
+							},
+							Status: types.StatusPassed,
+							Layer: ftypes.Layer{
+								DiffID: "sha256:9922bc15eeefe1637b803ef2106f178152ce19a391f24aec838cbe2e48e73303",
+							},
+						},
+					},
+				},
+				{
+					Target: "/app/configs/pod.yaml",
+					Class:  report.ClassConfig,
+					Type:   ftypes.Kubernetes,
+					Misconfigurations: []types.DetectedMisconfiguration{
+						{
+							Type:      "Kubernetes Security Check",
+							ID:        "ID300",
+							Title:     "Bad Deployment",
+							Message:   "No issues found",
+							Namespace: "main.kubernetes.id300",
+							Severity:  "MEDIUM",
+							Status:    types.StatusFailure,
+							Layer: ftypes.Layer{
+								DiffID: "sha256:9922bc15eeefe1637b803ef2106f178152ce19a391f24aec838cbe2e48e73303",
+							},
+						},
+						{
+							Type:      "Kubernetes Security Check",
+							ID:        "ID100",
+							Title:     "Bad Deployment",
+							Message:   "No issues found",
+							Namespace: "main.kubernetes.id100",
+							Severity:  "HIGH",
+							Status:    types.StatusException,
+							Layer: ftypes.Layer{
+								DiffID: "sha256:9922bc15eeefe1637b803ef2106f178152ce19a391f24aec838cbe2e48e73303",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			name: "sad path: ApplyLayers returns an error",
 			args: args{
 				target:   "alpine:latest",
 				layerIDs: []string{"sha256:5216338b40a7b96416b8b9858974bbe4acc3096ee60acbc4dfb1ee02aecceb10"},
-				options:  types.ScanOptions{VulnType: []string{"os", "library"}},
+				options: types.ScanOptions{
+					VulnType:       []string{types.VulnTypeOS, types.VulnTypeLibrary},
+					SecurityChecks: []string{types.SecurityCheckVulnerability},
+				},
 			},
 			fixtures: []string{"testdata/fixtures/happy.yaml"},
 			applyLayersExpectation: ApplierApplyLayersExpectation{
@@ -701,7 +895,10 @@ func TestScanner_Scan(t *testing.T) {
 			args: args{
 				target:   "alpine:latest",
 				layerIDs: []string{"sha256:5216338b40a7b96416b8b9858974bbe4acc3096ee60acbc4dfb1ee02aecceb10"},
-				options:  types.ScanOptions{VulnType: []string{"os", "library"}},
+				options: types.ScanOptions{
+					VulnType:       []string{types.VulnTypeOS, types.VulnTypeLibrary},
+					SecurityChecks: []string{types.SecurityCheckVulnerability},
+				},
 			},
 			fixtures: []string{"testdata/fixtures/happy.yaml"},
 			applyLayersExpectation: ApplierApplyLayersExpectation{
@@ -753,7 +950,10 @@ func TestScanner_Scan(t *testing.T) {
 			args: args{
 				target:   "alpine:latest",
 				layerIDs: []string{"sha256:5216338b40a7b96416b8b9858974bbe4acc3096ee60acbc4dfb1ee02aecceb10"},
-				options:  types.ScanOptions{VulnType: []string{"library"}},
+				options: types.ScanOptions{
+					VulnType:       []string{types.VulnTypeLibrary},
+					SecurityChecks: []string{types.SecurityCheckVulnerability},
+				},
 			},
 			fixtures: []string{"testdata/fixtures/sad.yaml"},
 			applyLayersExpectation: ApplierApplyLayersExpectation{

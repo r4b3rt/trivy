@@ -4,7 +4,7 @@ fullnameOverride: ""
 image:
   registry: docker.io
   repository: aquasec/trivy
-  tag: 0.15.0
+  tag: 0.18.3
   pullPolicy: IfNotPresent
   pullSecret: ""
 
@@ -99,6 +99,7 @@ ingress:
     # kubernetes.io/ingress.class: nginx
   hosts:
     - host: trivy.example.com
+  path: "/"
   tls: []
   #  - secretName: trivy-example-tls
   #    hosts:
