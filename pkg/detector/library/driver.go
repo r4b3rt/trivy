@@ -1,124 +1,192 @@
 package library
 
 import (
+	"strings"
+
+	"github.com/samber/lo"
 	"golang.org/x/xerrors"
 
-	"github.com/aquasecurity/fanal/analyzer/library"
-	ecosystem "github.com/aquasecurity/trivy-db/pkg/vulnsrc/ghsa"
+	"github.com/aquasecurity/trivy-db/pkg/db"
+	"github.com/aquasecurity/trivy-db/pkg/ecosystem"
+	dbTypes "github.com/aquasecurity/trivy-db/pkg/types"
 	"github.com/aquasecurity/trivy-db/pkg/vulnsrc/vulnerability"
-	"github.com/aquasecurity/trivy/pkg/detector/library/bundler"
-	"github.com/aquasecurity/trivy/pkg/detector/library/cargo"
-	"github.com/aquasecurity/trivy/pkg/detector/library/comparer"
-	"github.com/aquasecurity/trivy/pkg/detector/library/composer"
-	"github.com/aquasecurity/trivy/pkg/detector/library/ghsa"
-	"github.com/aquasecurity/trivy/pkg/detector/library/maven"
-	"github.com/aquasecurity/trivy/pkg/detector/library/npm"
-	"github.com/aquasecurity/trivy/pkg/detector/library/python"
+	"github.com/aquasecurity/trivy/pkg/detector/library/compare"
+	"github.com/aquasecurity/trivy/pkg/detector/library/compare/bitnami"
+	"github.com/aquasecurity/trivy/pkg/detector/library/compare/maven"
+	"github.com/aquasecurity/trivy/pkg/detector/library/compare/npm"
+	"github.com/aquasecurity/trivy/pkg/detector/library/compare/pep440"
+	"github.com/aquasecurity/trivy/pkg/detector/library/compare/rubygems"
+	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
+	"github.com/aquasecurity/trivy/pkg/log"
 	"github.com/aquasecurity/trivy/pkg/types"
 )
 
-type advisory interface {
-	DetectVulnerabilities(string, string) ([]types.DetectedVulnerability, error)
-}
-
 // NewDriver returns a driver according to the library type
-func NewDriver(libType string) (Driver, error) {
-	var driver Driver
+func NewDriver(libType ftypes.LangType) (Driver, bool) {
+	var eco ecosystem.Type
+	var comparer compare.Comparer
+
 	switch libType {
-	case library.Bundler:
-		driver = newRubyGemsDriver()
-	case library.Cargo:
-		driver = newCargoDriver()
-	case library.Composer:
-		driver = newComposerDriver()
-	case library.Npm, library.Yarn:
-		driver = newNpmDriver()
-	case library.Pipenv, library.Poetry:
-		driver = newPipDriver()
-	case library.NuGet:
-		driver = newNugetDriver()
-	case library.Jar:
-		driver = newMavenDriver()
+	case ftypes.Bundler, ftypes.GemSpec:
+		eco = ecosystem.RubyGems
+		comparer = rubygems.Comparer{}
+	case ftypes.RustBinary, ftypes.Cargo:
+		eco = ecosystem.Cargo
+		comparer = compare.GenericComparer{}
+	case ftypes.Composer, ftypes.ComposerVendor:
+		eco = ecosystem.Composer
+		comparer = compare.GenericComparer{}
+	case ftypes.GoBinary, ftypes.GoModule:
+		eco = ecosystem.Go
+		comparer = compare.GenericComparer{}
+	case ftypes.Jar, ftypes.Pom, ftypes.Gradle, ftypes.Sbt:
+		eco = ecosystem.Maven
+		comparer = maven.Comparer{}
+	case ftypes.Npm, ftypes.Yarn, ftypes.Pnpm, ftypes.Bun, ftypes.NodePkg, ftypes.JavaScript:
+		eco = ecosystem.Npm
+		comparer = npm.Comparer{}
+	case ftypes.NuGet, ftypes.DotNetCore, ftypes.PackagesProps:
+		eco = ecosystem.NuGet
+		comparer = compare.GenericComparer{}
+	case ftypes.Pipenv, ftypes.Poetry, ftypes.Pip, ftypes.PythonPkg, ftypes.Uv, ftypes.PyLock:
+		eco = ecosystem.Pip
+		comparer = pep440.Comparer{}
+	case ftypes.Pub:
+		eco = ecosystem.Pub
+		comparer = compare.GenericComparer{}
+	case ftypes.Hex:
+		eco = ecosystem.Erlang
+		comparer = compare.GenericComparer{}
+	case ftypes.Conan:
+		eco = ecosystem.Conan
+		// Only semver can be used for version ranges
+		// https://docs.conan.io/en/latest/versioning/version_ranges.html
+		comparer = compare.GenericComparer{}
+	case ftypes.Swift:
+		// Swift uses semver
+		// https://www.swift.org/package-manager/#importing-dependencies
+		eco = ecosystem.Swift
+		comparer = compare.GenericComparer{}
+	case ftypes.Cocoapods:
+		// CocoaPods uses RubyGems version specifiers
+		// https://guides.cocoapods.org/making/making-a-cocoapod.html#cocoapods-versioning-specifics
+		eco = ecosystem.Cocoapods
+		comparer = rubygems.Comparer{}
+	case ftypes.CondaPkg, ftypes.CondaEnv:
+		log.Warn("Conda package is supported for SBOM, not for vulnerability scanning")
+		return Driver{}, false
+	case ftypes.Bitnami:
+		eco = ecosystem.Bitnami
+		comparer = bitnami.Comparer{}
+	case ftypes.K8sUpstream:
+		eco = ecosystem.Kubernetes
+		comparer = compare.GenericComparer{}
+	case ftypes.Julia:
+		eco = ecosystem.Julia
+		comparer = compare.GenericComparer{}
 	default:
-		return Driver{}, xerrors.Errorf("unsupported type %s", libType)
+		log.Warn("The library type is not supported for vulnerability scanning",
+			log.String("type", string(libType)))
+		return Driver{}, false
 	}
-	return driver, nil
+	return Driver{
+		ecosystem: eco,
+		comparer:  comparer,
+		dbc:       db.Config{},
+	}, true
 }
 
-// Driver implements the advisory
+// Driver represents security advisories for each programming language
 type Driver struct {
-	ecosystem  string
-	advisories []advisory
-}
-
-// Aggregate aggregates drivers
-func Aggregate(ecosystem string, advisories ...advisory) Driver {
-	return Driver{ecosystem: ecosystem, advisories: advisories}
-}
-
-// Detect scans and returns vulnerabilities
-func (d *Driver) Detect(pkgName string, pkgVer string) ([]types.DetectedVulnerability, error) {
-	var detectedVulnerabilities []types.DetectedVulnerability
-	uniqVulnIDMap := make(map[string]struct{})
-	for _, adv := range d.advisories {
-		vulns, err := adv.DetectVulnerabilities(pkgName, pkgVer)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to detect vulnerabilities: %w", err)
-		}
-		for _, vuln := range vulns {
-			if _, ok := uniqVulnIDMap[vuln.VulnerabilityID]; ok {
-				continue
-			}
-			uniqVulnIDMap[vuln.VulnerabilityID] = struct{}{}
-			detectedVulnerabilities = append(detectedVulnerabilities, vuln)
-		}
-	}
-
-	return detectedVulnerabilities, nil
+	ecosystem ecosystem.Type
+	comparer  compare.Comparer
+	dbc       db.Config
 }
 
 // Type returns the driver ecosystem
 func (d *Driver) Type() string {
-	return d.ecosystem
+	return string(d.ecosystem)
 }
 
-func newRubyGemsDriver() Driver {
-	c := bundler.RubyGemsComparer{}
-	return Aggregate(vulnerability.RubyGems, ghsa.NewAdvisory(ecosystem.Rubygems, c), bundler.NewAdvisory(),
-		NewAdvisory(vulnerability.RubyGems, c))
+// DetectVulnerabilities scans buckets with the prefix according to the ecosystem.
+// If "ecosystem" is pip, it looks for buckets with "pip::" and gets security advisories from those buckets.
+// It allows us to add a new data source with the ecosystem prefix (e.g. pip::new-data-source)
+// and detect vulnerabilities without specifying a specific bucket name.
+func (d *Driver) DetectVulnerabilities(pkgID, pkgName, pkgVer string) ([]types.DetectedVulnerability, error) {
+	normalizedName := vulnerability.NormalizePkgName(d.ecosystem, pkgName)
+
+	advisories, comparer, err := d.advisories(normalizedName, pkgVer)
+	if err != nil {
+		return nil, err
+	}
+
+	var vulns []types.DetectedVulnerability
+	for _, adv := range advisories {
+		if !comparer.IsVulnerable(pkgVer, adv) {
+			continue
+		}
+
+		vuln := types.DetectedVulnerability{
+			VulnerabilityID:  adv.VulnerabilityID,
+			VendorIDs:        adv.VendorIDs, // Any vendors have specific IDs, e.g. GHSA, JLSEC
+			PkgID:            pkgID,
+			PkgName:          pkgName,
+			InstalledVersion: pkgVer,
+			FixedVersion:     createFixedVersions(adv),
+			DataSource:       adv.DataSource,
+			Custom:           adv.Custom,
+		}
+		vulns = append(vulns, vuln)
+	}
+
+	return vulns, nil
 }
 
-func newComposerDriver() Driver {
-	c := comparer.GenericComparer{}
-	return Aggregate(vulnerability.Composer, ghsa.NewAdvisory(ecosystem.Composer, c), composer.NewAdvisory(),
-		NewAdvisory(vulnerability.Composer, c))
+// advisories resolves the advisory bucket for the package and returns the
+// matching advisories together with the version comparer to use.
+//
+// For supplier packages (e.g. Seal Security), it prefers the supplier-specific
+// bucket and comparer. When the supplier match is only a candidate (a version
+// suffix that can also appear on real packages, e.g. `-spN` on Go/npm), the
+// supplier bucket is used only if it actually contains advisories for the
+// package; otherwise it falls back to the default ecosystem bucket.
+func (d *Driver) advisories(normalizedName, pkgVer string) ([]dbTypes.Advisory, compare.Comparer, error) {
+	if v, res := lookupSupplier(d.ecosystem, normalizedName, pkgVer); res != NoMatch {
+		advisories, err := d.dbc.GetAdvisories(v.BucketPrefix(d.ecosystem), normalizedName)
+		if err != nil {
+			return nil, nil, xerrors.Errorf("failed to get %s advisories: %w", d.ecosystem, err)
+		}
+		if res == Matched || len(advisories) > 0 {
+			return advisories, v.Comparer(d.ecosystem, d.comparer), nil
+		}
+		// Candidate match without supplier advisories: fall back to the default bucket.
+	}
+
+	advisories, err := d.dbc.GetAdvisories(defaultBucketPrefix(d.ecosystem), normalizedName)
+	if err != nil {
+		return nil, nil, xerrors.Errorf("failed to get %s advisories: %w", d.ecosystem, err)
+	}
+	return advisories, d.comparer, nil
 }
 
-func newCargoDriver() Driver {
-	return Aggregate(vulnerability.Cargo, cargo.NewAdvisory(),
-		NewAdvisory(vulnerability.Cargo, comparer.GenericComparer{}))
+func createFixedVersions(advisory dbTypes.Advisory) string {
+	if len(advisory.PatchedVersions) != 0 {
+		return joinFixedVersions(advisory.PatchedVersions)
+	}
+
+	var fixedVersions []string
+	for _, version := range advisory.VulnerableVersions {
+		for s := range strings.SplitSeq(version, ",") {
+			s = strings.TrimSpace(s)
+			if !strings.HasPrefix(s, "<=") && strings.HasPrefix(s, "<") {
+				s = strings.TrimPrefix(s, "<")
+				fixedVersions = append(fixedVersions, strings.TrimSpace(s))
+			}
+		}
+	}
+	return joinFixedVersions(fixedVersions)
 }
 
-func newNpmDriver() Driver {
-	c := npm.Comparer{}
-	return Aggregate(vulnerability.Npm, ghsa.NewAdvisory(ecosystem.Npm, c),
-		npm.NewAdvisory(), NewAdvisory(vulnerability.Npm, c))
-}
-
-func newPipDriver() Driver {
-	c := comparer.GenericComparer{}
-	return Aggregate(vulnerability.Pip, ghsa.NewAdvisory(ecosystem.Pip, c),
-		python.NewAdvisory(), NewAdvisory(vulnerability.Pip, c))
-}
-
-func newNugetDriver() Driver {
-	c := comparer.GenericComparer{}
-	return Aggregate(vulnerability.NuGet, ghsa.NewAdvisory(ecosystem.Nuget, c),
-		NewAdvisory(vulnerability.NuGet, c))
-}
-
-func newMavenDriver() Driver {
-	c := maven.Comparer{}
-	return Aggregate(vulnerability.Maven, ghsa.NewAdvisory(ecosystem.Maven, c),
-		NewAdvisory(vulnerability.Maven, c))
+func joinFixedVersions(fixedVersions []string) string {
+	return strings.Join(lo.Uniq(fixedVersions), ", ")
 }

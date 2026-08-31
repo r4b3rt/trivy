@@ -2,113 +2,132 @@ package operation
 
 import (
 	"context"
-	"os"
-	"strings"
+	"sync"
 
-	"github.com/go-redis/redis/v8"
-	"github.com/google/wire"
-	"github.com/spf13/afero"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/samber/lo"
 	"golang.org/x/xerrors"
 
-	"github.com/aquasecurity/fanal/cache"
 	"github.com/aquasecurity/trivy/pkg/db"
+	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
+	"github.com/aquasecurity/trivy/pkg/flag"
 	"github.com/aquasecurity/trivy/pkg/log"
-	"github.com/aquasecurity/trivy/pkg/utils"
+	"github.com/aquasecurity/trivy/pkg/misconf"
+	"github.com/aquasecurity/trivy/pkg/policy"
+	"github.com/aquasecurity/trivy/pkg/types"
+	"github.com/aquasecurity/trivy/pkg/vex"
+	"github.com/aquasecurity/trivy/pkg/vex/repo"
 )
 
-// SuperSet binds cache dependencies
-var SuperSet = wire.NewSet(
-	cache.NewFSCache,
-	wire.Bind(new(cache.LocalArtifactCache), new(cache.FSCache)),
-	NewCache,
-)
-
-// Cache implements the local cache
-type Cache struct {
-	cache.Cache
-}
-
-// NewCache is the factory method for Cache
-func NewCache(backend string) (Cache, error) {
-	if strings.HasPrefix(backend, "redis://") {
-		log.Logger.Infof("Redis cache: %s", backend)
-		options, err := redis.ParseURL(backend)
-		if err != nil {
-			return Cache{}, err
-		}
-		redisCache := cache.NewRedisCache(options)
-		return Cache{Cache: redisCache}, nil
-	}
-	fsCache, err := cache.NewFSCache(utils.CacheDir())
-	if err != nil {
-		return Cache{}, xerrors.Errorf("unable to initialize fs cache: %w", err)
-	}
-	return Cache{Cache: fsCache}, nil
-}
-
-// Reset resets the cache
-func (c Cache) Reset() (err error) {
-	if err := c.ClearDB(); err != nil {
-		return xerrors.Errorf("failed to clear the database: %w", err)
-	}
-	if err := c.ClearImages(); err != nil {
-		return xerrors.Errorf("failed to clear the image cache: %w", err)
-	}
-	return nil
-}
-
-// ClearDB clears the DB cache
-func (c Cache) ClearDB() (err error) {
-	log.Logger.Info("Removing DB file...")
-	if err = os.RemoveAll(utils.CacheDir()); err != nil {
-		return xerrors.Errorf("failed to remove the directory (%s) : %w", utils.CacheDir(), err)
-	}
-	return nil
-}
-
-// ClearImages clears the cache images
-func (c Cache) ClearImages() error {
-	log.Logger.Info("Removing image caches...")
-	if err := c.Clear(); err != nil {
-		return xerrors.Errorf("failed to remove the cache: %w", err)
-	}
-	return nil
-}
+var mu sync.Mutex
 
 // DownloadDB downloads the DB
-func DownloadDB(appVersion, cacheDir string, quiet, light, skipUpdate bool) error {
-	client := initializeDBClient(cacheDir, quiet)
-	ctx := context.Background()
-	needsUpdate, err := client.NeedsUpdate(appVersion, light, skipUpdate)
+func DownloadDB(ctx context.Context, appVersion, cacheDir string, dbRepositories []name.Reference, quiet, skipUpdate bool,
+	opt ftypes.RegistryOptions) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	ctx = log.WithContextPrefix(ctx, log.PrefixVulnerabilityDB)
+	dbDir := db.Dir(cacheDir)
+	client := db.NewClient(dbDir, quiet, db.WithDBRepository(dbRepositories))
+	needsUpdate, err := client.NeedsUpdate(ctx, appVersion, skipUpdate)
 	if err != nil {
 		return xerrors.Errorf("database error: %w", err)
 	}
 
 	if needsUpdate {
-		log.Logger.Info("Need to update DB")
-		log.Logger.Info("Downloading DB...")
-		if err = client.Download(ctx, cacheDir, light); err != nil {
+		log.InfoContext(ctx, "Need to update DB")
+		if err = client.Download(ctx, dbDir, opt); err != nil {
 			return xerrors.Errorf("failed to download vulnerability DB: %w", err)
-		}
-		if err = client.UpdateMetadata(cacheDir); err != nil {
-			return xerrors.Errorf("unable to update database metadata: %w", err)
 		}
 	}
 
 	// for debug
-	if err := showDBInfo(cacheDir); err != nil {
+	if err = client.ShowInfo(); err != nil {
 		return xerrors.Errorf("failed to show database info: %w", err)
 	}
 	return nil
 }
 
-func showDBInfo(cacheDir string) error {
-	m := db.NewMetadata(afero.NewOsFs(), cacheDir)
-	metadata, err := m.Get()
-	if err != nil {
-		return xerrors.Errorf("something wrong with DB: %w", err)
+func DownloadVEXRepositories(ctx context.Context, opts flag.Options) error {
+	ctx = log.WithContextPrefix(ctx, "vex")
+	if opts.SkipVEXRepoUpdate {
+		log.InfoContext(ctx, "Skipping VEX repository update")
+		return nil
 	}
-	log.Logger.Debugf("DB Schema: %d, Type: %d, UpdatedAt: %s, NextUpdate: %s, DownloadedAt: %s",
-		metadata.Version, metadata.Type, metadata.UpdatedAt, metadata.NextUpdate, metadata.DownloadedAt)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Download VEX repositories only if `--vex repo` is passed.
+	_, enabled := lo.Find(opts.VEXSources, func(src vex.Source) bool {
+		return src.Type == vex.TypeRepository
+	})
+	if !enabled {
+		return nil
+	}
+
+	err := repo.NewManager(opts.CacheDir).DownloadRepositories(ctx, nil, repo.Options{
+		Insecure: opts.Insecure,
+	})
+	if err != nil {
+		return xerrors.Errorf("failed to download vex repositories: %w", err)
+	}
+
+	return nil
+
+}
+
+// InitBuiltinChecks downloads the built-in policies and loads them
+func InitBuiltinChecks(ctx context.Context, client *policy.Client, skipUpdate bool, registryOpts ftypes.RegistryOptions) (string, error) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	ctx = log.WithContextPrefix(ctx, "checks-client")
+
+	var err error
+
+	if skipUpdate {
+		log.InfoContext(ctx, "No downloadable checks were loaded as --skip-check-update is enabled, loading from existing cache...")
+
+		path := client.BuiltinChecksPath()
+		_, _, err := misconf.CheckPathExists(path)
+		if err != nil {
+			return "", xerrors.Errorf("failed to check cache: %w", err)
+		}
+		return path, nil
+	}
+
+	needsUpdate, err := client.NeedsUpdate(ctx, registryOpts)
+	if err != nil {
+		return "", xerrors.Errorf("unable to check if built-in policies need to be updated: %w", err)
+	}
+
+	if needsUpdate {
+		log.InfoContext(ctx, "Need to update the checks bundle")
+		log.InfoContext(ctx, "Downloading the checks bundle...")
+		if err = client.DownloadBuiltinChecks(ctx, registryOpts); err != nil {
+			return "", xerrors.Errorf("failed to download checks bundle: %w", err)
+		}
+	} else {
+		log.InfoContext(ctx,
+			"Using existing checks from cache",
+			log.String("path", client.BuiltinChecksPath()),
+		)
+	}
+
+	return client.BuiltinChecksPath(), nil
+}
+
+func Exit(opts flag.Options, failedResults bool, m types.Metadata) error {
+	if opts.ExitOnEOL != 0 && m.OS != nil && m.OS.Eosl {
+		log.Error("Detected EOL OS", log.String("family", string(m.OS.Family)),
+			log.String("version", m.OS.Name))
+		return &types.ExitError{Code: opts.ExitOnEOL}
+	}
+
+	if opts.ExitCode != 0 && failedResults {
+		return &types.ExitError{Code: opts.ExitCode}
+	}
 	return nil
 }

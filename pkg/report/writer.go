@@ -1,278 +1,139 @@
 package report
 
 import (
-	"bytes"
-	"encoding/json"
-	"encoding/xml"
-	"fmt"
-	"html"
+	"context"
 	"io"
-	"io/ioutil"
-	"os"
-	"regexp"
 	"strings"
-	"text/template"
-	"time"
 
-	"github.com/Masterminds/sprig"
-	"github.com/olekukonko/tablewriter"
+	"github.com/hashicorp/go-multierror"
 	"golang.org/x/xerrors"
 
-	ftypes "github.com/aquasecurity/fanal/types"
-	dbTypes "github.com/aquasecurity/trivy-db/pkg/types"
-	"github.com/aquasecurity/trivy-db/pkg/vulnsrc/vulnerability"
+	cr "github.com/aquasecurity/trivy/pkg/compliance/report"
+	"github.com/aquasecurity/trivy/pkg/extension"
+	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
+	"github.com/aquasecurity/trivy/pkg/flag"
+	"github.com/aquasecurity/trivy/pkg/log"
+	"github.com/aquasecurity/trivy/pkg/report/cyclonedx"
+	"github.com/aquasecurity/trivy/pkg/report/github"
+	"github.com/aquasecurity/trivy/pkg/report/predicate"
+	"github.com/aquasecurity/trivy/pkg/report/spdx"
+	"github.com/aquasecurity/trivy/pkg/report/table"
 	"github.com/aquasecurity/trivy/pkg/types"
-	"github.com/aquasecurity/trivy/pkg/utils"
 )
 
-// Now returns the current time
-var Now = time.Now
+const (
+	SchemaVersion = 2
+)
 
-// regex to extract file path in case string includes (distro:version)
-var re = regexp.MustCompile(`(?P<path>.+?)(?:\s*\((?:.*?)\).*?)?$`)
+// Write writes the result to output, format as passed in argument
+func Write(ctx context.Context, report types.Report, option flag.Options) (err error) {
+	// Call pre-report hooks
+	if err := extension.PreReport(ctx, &report, option); err != nil {
+		return xerrors.Errorf("pre report error: %w", err)
+	}
 
-// Results to hold list of Result
-type Results []Result
+	output, cleanup, err := option.OutputWriter(ctx)
+	if err != nil {
+		return xerrors.Errorf("failed to create a file: %w", err)
+	}
+	defer func() {
+		if cerr := cleanup(); cerr != nil {
+			err = multierror.Append(err, cerr)
+		}
+	}()
 
-// Result to hold image scan results
-type Result struct {
-	Target          string                        `json:"Target"`
-	Type            string                        `json:"Type,omitempty"`
-	Packages        []ftypes.Package              `json:"Packages,omitempty"`
-	Vulnerabilities []types.DetectedVulnerability `json:"Vulnerabilities"`
-}
+	// Compliance report
+	if option.Compliance.Spec.ID != "" {
+		return complianceWrite(ctx, report, option, output)
+	}
 
-// WriteResults writes the result to output, format as passed in argument
-func WriteResults(format string, output io.Writer, severities []dbTypes.Severity, results Results, outputTemplate string, light bool) error {
 	var writer Writer
-	switch format {
-	case "table":
-		writer = &TableWriter{Output: output, Light: light, Severities: severities}
-	case "json":
-		writer = &JSONWriter{Output: output}
-	case "template":
-		var err error
-		if writer, err = NewTemplateWriter(output, outputTemplate); err != nil {
+	switch option.Format {
+	case types.FormatTable:
+		writer = table.NewWriter(table.Options{
+			Scanners:             option.Scanners,
+			Output:               output,
+			Severities:           option.Severities,
+			Tree:                 option.DependencyTree,
+			ShowSuppressed:       option.ShowSuppressed,
+			IncludeNonFailures:   option.IncludeNonFailures,
+			Trace:                option.RegoOptions.Trace,
+			RenderCause:          option.RenderCause,
+			LicenseRiskThreshold: option.LicenseRiskThreshold,
+			IgnoredLicenses:      option.IgnoredLicenses,
+			TableModes:           option.TableModes,
+		})
+	case types.FormatJSON:
+		writer = &JSONWriter{
+			Output:         output,
+			ListAllPkgs:    option.ListAllPkgs,
+			ShowSuppressed: option.ShowSuppressed,
+		}
+	case types.FormatGitHub:
+		writer = &github.Writer{
+			Output:  output,
+			Version: option.AppVersion,
+		}
+	case types.FormatCycloneDX:
+		// TODO: support xml format option with cyclonedx writer
+		writer = cyclonedx.NewWriter(output, option.AppVersion)
+	case types.FormatSPDX, types.FormatSPDXJSON:
+		writer = spdx.NewWriter(output, option.AppVersion, option.Format)
+	case types.FormatTemplate:
+		// We keep `sarif.tpl` template working for backward compatibility for a while.
+		if strings.HasPrefix(option.Template, "@") && strings.HasSuffix(option.Template, "sarif.tpl") {
+			log.Warn("Using `--template sarif.tpl` is deprecated. Please migrate to `--format sarif`. See https://github.com/aquasecurity/trivy/discussions/1571")
+			writer = &SarifWriter{
+				Output:  output,
+				Version: option.AppVersion,
+			}
+			break
+		}
+		if writer, err = NewTemplateWriter(output, option.Template, option.AppVersion); err != nil {
 			return xerrors.Errorf("failed to initialize template writer: %w", err)
 		}
+	case types.FormatSarif:
+		target := ""
+		if report.ArtifactType == ftypes.TypeFilesystem || report.ArtifactType == ftypes.TypeRepository {
+			target = option.Target
+		}
+		writer = &SarifWriter{
+			Output:  output,
+			Version: option.AppVersion,
+			Target:  target,
+		}
+	case types.FormatCosignVuln:
+		writer = predicate.NewVulnWriter(output, option.AppVersion)
 	default:
-		return xerrors.Errorf("unknown format: %v", format)
+		return xerrors.Errorf("unknown format: %v", option.Format)
 	}
 
-	if err := writer.Write(results); err != nil {
+	if err = writer.Write(ctx, report); err != nil {
 		return xerrors.Errorf("failed to write results: %w", err)
 	}
+
+	// Call post-report hooks
+	if err := extension.PostReport(ctx, &report, option); err != nil {
+		return xerrors.Errorf("post report error: %w", err)
+	}
+
 	return nil
+}
+
+func complianceWrite(ctx context.Context, report types.Report, opt flag.Options, output io.Writer) error {
+	complianceReport, err := cr.BuildComplianceReport([]types.Results{report.Results}, opt.Compliance)
+	if err != nil {
+		return xerrors.Errorf("compliance report build error: %w", err)
+	}
+	return cr.Write(ctx, complianceReport, cr.Option{
+		Format:     opt.Format,
+		Report:     opt.ReportFormat,
+		Output:     output,
+		Severities: opt.Severities,
+	})
 }
 
 // Writer defines the result write operation
 type Writer interface {
-	Write(Results) error
-}
-
-// TableWriter implements Writer and output in tabular form
-type TableWriter struct {
-	Severities []dbTypes.Severity
-	Output     io.Writer
-	Light      bool
-}
-
-// Write writes the result on standard output
-func (tw TableWriter) Write(results Results) error {
-	for _, result := range results {
-		if len(result.Vulnerabilities) == 0 {
-			continue
-		}
-		tw.write(result)
-	}
-	return nil
-}
-
-func (tw TableWriter) write(result Result) {
-	table := tablewriter.NewWriter(tw.Output)
-	header := []string{"Library", "Vulnerability ID", "Severity", "Installed Version", "Fixed Version"}
-	if !tw.Light {
-		header = append(header, "Title")
-	}
-	table.SetHeader(header)
-	severityCount := tw.setRows(table, result.Vulnerabilities)
-
-	var results []string
-
-	var severities []string
-	for _, sev := range tw.Severities {
-		severities = append(severities, sev.String())
-	}
-
-	for _, severity := range dbTypes.SeverityNames {
-		if !utils.StringInSlice(severity, severities) {
-			continue
-		}
-		r := fmt.Sprintf("%s: %d", severity, severityCount[severity])
-		results = append(results, r)
-	}
-
-	fmt.Printf("\n%s\n", result.Target)
-	fmt.Println(strings.Repeat("=", len(result.Target)))
-	fmt.Printf("Total: %d (%s)\n\n", len(result.Vulnerabilities), strings.Join(results, ", "))
-
-	if len(result.Vulnerabilities) == 0 {
-		return
-	}
-
-	table.SetAutoMergeCells(true)
-	table.SetRowLine(true)
-	table.Render()
-	return
-}
-
-func (tw TableWriter) setRows(table *tablewriter.Table, vulns []types.DetectedVulnerability) map[string]int {
-	severityCount := map[string]int{}
-	for _, v := range vulns {
-		severityCount[v.Severity]++
-
-		title := v.Title
-		if title == "" {
-			title = v.Description
-		}
-		splitTitle := strings.Split(title, " ")
-		if len(splitTitle) >= 12 {
-			title = strings.Join(splitTitle[:12], " ") + "..."
-		}
-
-		if len(v.PrimaryURL) > 0 {
-			r := strings.NewReplacer("https://", "", "http://", "")
-			title = fmt.Sprintf("%s -->%s", title, r.Replace(v.PrimaryURL))
-		}
-
-		var row []string
-		if tw.Output == os.Stdout {
-			row = []string{v.PkgName, v.VulnerabilityID, dbTypes.ColorizeSeverity(v.Severity),
-				v.InstalledVersion, v.FixedVersion}
-		} else {
-			row = []string{v.PkgName, v.VulnerabilityID, v.Severity, v.InstalledVersion, v.FixedVersion}
-		}
-
-		if !tw.Light {
-			row = append(row, strings.TrimSpace(title))
-		}
-		table.Append(row)
-	}
-	return severityCount
-}
-
-// JSONWriter implements result Writer
-type JSONWriter struct {
-	Output io.Writer
-}
-
-// Write writes the results in JSON format
-func (jw JSONWriter) Write(results Results) error {
-	output, err := json.MarshalIndent(results, "", "  ")
-	if err != nil {
-		return xerrors.Errorf("failed to marshal json: %w", err)
-	}
-
-	if _, err = fmt.Fprint(jw.Output, string(output)); err != nil {
-		return xerrors.Errorf("failed to write json: %w", err)
-	}
-	return nil
-}
-
-// TemplateWriter write result in custom format defined by user's template
-type TemplateWriter struct {
-	Output   io.Writer
-	Template *template.Template
-}
-
-// NewTemplateWriter is the factory method to return TemplateWriter object
-func NewTemplateWriter(output io.Writer, outputTemplate string) (*TemplateWriter, error) {
-	if strings.HasPrefix(outputTemplate, "@") {
-		buf, err := ioutil.ReadFile(strings.TrimPrefix(outputTemplate, "@"))
-		if err != nil {
-			return nil, xerrors.Errorf("error retrieving template from path: %w", err)
-		}
-		outputTemplate = string(buf)
-	}
-	var templateFuncMap template.FuncMap
-	templateFuncMap = sprig.GenericFuncMap()
-	templateFuncMap["escapeXML"] = func(input string) string {
-		escaped := &bytes.Buffer{}
-		if err := xml.EscapeText(escaped, []byte(input)); err != nil {
-			fmt.Printf("error while escapeString to XML: %v", err.Error())
-			return input
-		}
-		return escaped.String()
-	}
-	templateFuncMap["toSarifErrorLevel"] = toSarifErrorLevel
-	templateFuncMap["toSarifRuleName"] = toSarifRuleName
-	templateFuncMap["endWithPeriod"] = func(input string) string {
-		if !strings.HasSuffix(input, ".") {
-			input += "."
-		}
-		return input
-	}
-	templateFuncMap["toLower"] = func(input string) string {
-		return strings.ToLower(input)
-	}
-	templateFuncMap["escapeString"] = func(input string) string {
-		return html.EscapeString(input)
-	}
-	templateFuncMap["toPathUri"] = func(input string) string {
-		var matches = re.FindStringSubmatch(input)
-		if matches != nil {
-			input = matches[re.SubexpIndex("path")]
-		}
-		input = strings.ReplaceAll(input, "\\", "/")
-		return input
-	}
-	templateFuncMap["getEnv"] = func(key string) string {
-		return os.Getenv(key)
-	}
-	templateFuncMap["getCurrentTime"] = func() string {
-		return Now().UTC().Format(time.RFC3339Nano)
-	}
-	tmpl, err := template.New("output template").Funcs(templateFuncMap).Parse(outputTemplate)
-	if err != nil {
-		return nil, xerrors.Errorf("error parsing template: %w", err)
-	}
-	return &TemplateWriter{Output: output, Template: tmpl}, nil
-}
-
-// Write writes result
-func (tw TemplateWriter) Write(results Results) error {
-	err := tw.Template.Execute(tw.Output, results)
-	if err != nil {
-		return xerrors.Errorf("failed to write with template: %w", err)
-	}
-	return nil
-}
-
-func toSarifRuleName(vulnerabilityType string) string {
-	var ruleName string
-	switch vulnerabilityType {
-	case vulnerability.Ubuntu, vulnerability.Alpine, vulnerability.RedHat, vulnerability.RedHatOVAL,
-		vulnerability.Debian, vulnerability.DebianOVAL, vulnerability.Fedora, vulnerability.Amazon,
-		vulnerability.OracleOVAL, vulnerability.SuseCVRF, vulnerability.OpenSuseCVRF, vulnerability.Photon,
-		vulnerability.CentOS:
-		ruleName = "OS Package Vulnerability"
-	case "npm", "yarn", "nuget", "pipenv", "poetry", "bundler", "cargo", "composer":
-		ruleName = "Programming Language Vulnerability"
-	default:
-		ruleName = "Other Vulnerability"
-	}
-	return fmt.Sprintf("%s (%s)", ruleName, strings.Title(vulnerabilityType))
-}
-
-func toSarifErrorLevel(severity string) string {
-	switch severity {
-	case "CRITICAL", "HIGH":
-		return "error"
-	case "MEDIUM":
-		return "warning"
-	case "LOW", "UNKNOWN":
-		return "note"
-	default:
-		return "none"
-	}
+	Write(context.Context, types.Report) error
 }

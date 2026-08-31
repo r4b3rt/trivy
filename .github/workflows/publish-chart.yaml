@@ -1,51 +1,85 @@
-name: Publish Chart Helm
+
+name: Publish Helm chart
+
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - closed
+    branches:
+      - main
     paths:
       - 'helm/trivy/**'
-  workflow_dispatch:
 env:
-  HELM_REP: helm-charts
-  GH_OWNER: aquasecurity
-  CHART_DIR: helm/trivy
+  KIND_VERSION: "v0.14.0"
+  KIND_IMAGE: "kindest/node:v1.23.6@sha256:b1fa224cc6c7ff32455e0b1fd9cbfd3d3bc87ecaa8fcb06961ed1afb3db0f9ae"
 jobs:
-  release:
-    runs-on: ubuntu-20.04
+  # `test-chart` job starts if a PR with Helm Chart is created, merged etc.
+  test-chart:
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install Helm
-        uses: azure/setup-helm@v1
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
-          version: v3.5.0
-      - name: Install chart-releaser
+          version: v3.14.4
+      - name: Set up python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.x'
+          check-latest: true
+      - name: Setup Chart Linting
+        id: lint
+        uses: helm/chart-testing-action@6ec842c01de15ebb84c8627d2744a0c2f2755c9f # v2.8.0
+        with:
+          # v6.0.0 resolved the compatibility issue with Python > 3.13. may be removed after the action itself is updated
+          yamale_version: "6.0.0"
+      - name: Setup Kubernetes cluster (KIND)
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          version: ${{ env.KIND_VERSION }}
+          image: ${{ env.KIND_IMAGE }}
+      - name: Run chart-testing
+        run: ct lint-and-install --validate-maintainers=false --charts helm/trivy
+      - name: Run chart-testing (Ingress enabled)
         run: |
-          wget https://github.com/helm/chart-releaser/releases/download/v1.1.1/chart-releaser_1.1.1_linux_amd64.tar.gz
-          tar xzvf chart-releaser_1.1.1_linux_amd64.tar.gz cr
-      - name: Package helm chart
-        run: |
-          ./cr package ${{ env.CHART_DIR }}
-      - name: Upload helm chart
-        # Failed with upload the same version: https://github.com/helm/chart-releaser/issues/101
-        continue-on-error: true
-        ## Upload the tar in the Releases repository
-        run: |
-          ./cr upload -o ${{ env.GH_OWNER }} -r ${{ env.HELM_REP }} --token ${{ secrets.ORG_GITHUB_TOKEN }} -p .cr-release-packages
-      - name: Index helm chart
-        run: |
-          ./cr index -o ${{ env.GH_OWNER }} -r ${{ env.HELM_REP }} -c https://${{ env.GH_OWNER }}.github.io/${{ env.HELM_REP }}/ -i index.yaml
+          sed -i -e '136s,false,'true',g' ./helm/trivy/values.yaml
+          ct lint-and-install --validate-maintainers=false --charts helm/trivy
 
-      - name: Push index file
-        uses: dmnemec/copy_file_to_another_repo_action@v1.0.4
-        env:
-          API_TOKEN_GITHUB: ${{ secrets.ORG_GITHUB_TOKEN }}
+
+  # `publish-chart` job starts if a PR with a new Helm Chart is merged or manually
+  publish-chart:
+    if: github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch'
+    needs:
+      - test-chart
+    runs-on: ubuntu-2404-2core
+    steps:
+      # GITHUB_TOKEN is scoped to the current repository and cannot trigger
+      # workflows in other repos — generate a GitHub App installation token instead.
+      - name: Generate token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          source_file: 'index.yaml'
-          destination_repo: '${{ env.GH_OWNER }}/${{ env.HELM_REP }}'
-          destination_folder: '.'
-          destination_branch: 'gh-pages'
-          user_email: aqua-bot@users.noreply.github.com
-          user_name: 'aqua-bot'
+          client-id: ${{ secrets.ACTIONS_MULTI_WRITE_GH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.TRIVY_WORKFLOW_TRIGGER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: helm-charts
+          permission-actions: write
+      - name: Trigger publish-chart workflow in helm-charts
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REF: ${{ github.sha }}
+        run: |
+          gh workflow run publish-chart.yaml \
+            --repo "$GITHUB_REPOSITORY_OWNER/helm-charts" \
+            --ref main \
+            --field "repository=$GITHUB_REPOSITORY" \
+            --field "ref=$REF" \
+            --field "chart_dir=helm/trivy"

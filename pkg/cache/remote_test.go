@@ -8,36 +8,35 @@ import (
 	"testing"
 	"time"
 
-	rpcScanner "github.com/aquasecurity/trivy/rpc/scanner"
-
-	google_protobuf "github.com/golang/protobuf/ptypes/empty"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twitchtv/twirp"
 	"golang.org/x/xerrors"
+	"google.golang.org/protobuf/types/known/emptypb"
 
-	fcache "github.com/aquasecurity/fanal/cache"
-	"github.com/aquasecurity/fanal/types"
 	"github.com/aquasecurity/trivy/pkg/cache"
+	"github.com/aquasecurity/trivy/pkg/fanal/types"
+	xhttp "github.com/aquasecurity/trivy/pkg/x/http"
 	rpcCache "github.com/aquasecurity/trivy/rpc/cache"
+	rpcScanner "github.com/aquasecurity/trivy/rpc/scanner"
 )
 
 type mockCacheServer struct {
-	cache fcache.Cache
+	cache cache.Cache
 }
 
-func (s *mockCacheServer) PutArtifact(_ context.Context, in *rpcCache.PutArtifactRequest) (*google_protobuf.Empty, error) {
+func (s *mockCacheServer) PutArtifact(_ context.Context, in *rpcCache.PutArtifactRequest) (*emptypb.Empty, error) {
 	if strings.Contains(in.ArtifactId, "invalid") {
-		return &google_protobuf.Empty{}, xerrors.New("invalid image ID")
+		return &emptypb.Empty{}, xerrors.New("invalid image ID")
 	}
-	return &google_protobuf.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
-func (s *mockCacheServer) PutBlob(_ context.Context, in *rpcCache.PutBlobRequest) (*google_protobuf.Empty, error) {
+func (s *mockCacheServer) PutBlob(_ context.Context, in *rpcCache.PutBlobRequest) (*emptypb.Empty, error) {
 	if strings.Contains(in.DiffId, "invalid") {
-		return &google_protobuf.Empty{}, xerrors.New("invalid layer ID")
+		return &emptypb.Empty{}, xerrors.New("invalid layer ID")
 	}
-	return &google_protobuf.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 func (s *mockCacheServer) MissingBlobs(_ context.Context, in *rpcCache.MissingBlobsRequest) (*rpcCache.MissingBlobsResponse, error) {
@@ -48,7 +47,19 @@ func (s *mockCacheServer) MissingBlobs(_ context.Context, in *rpcCache.MissingBl
 		}
 		layerIDs = append(layerIDs, layerID)
 	}
-	return &rpcCache.MissingBlobsResponse{MissingArtifact: true, MissingBlobIds: layerIDs}, nil
+	return &rpcCache.MissingBlobsResponse{
+		MissingArtifact: true,
+		MissingBlobIds:  layerIDs,
+	}, nil
+}
+
+func (s *mockCacheServer) DeleteBlobs(_ context.Context, in *rpcCache.DeleteBlobsRequest) (*emptypb.Empty, error) {
+	for _, blobId := range in.GetBlobIds() {
+		if strings.Contains(blobId, "invalid") {
+			return &emptypb.Empty{}, xerrors.New("invalid layer ID")
+		}
+	}
+	return &emptypb.Empty{}, nil
 }
 
 func withToken(base http.Handler, token, tokenHeader string) http.Handler {
@@ -135,15 +146,16 @@ func TestRemoteCache_PutArtifact(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := cache.NewRemoteCache(cache.RemoteURL(ts.URL), tt.args.customHeaders)
-			err := c.PutArtifact(tt.args.imageID, tt.args.imageInfo)
+			c := cache.NewRemoteCache(t.Context(), cache.RemoteOptions{
+				ServerAddr:    ts.URL,
+				CustomHeaders: tt.args.customHeaders,
+			})
+			err := c.PutArtifact(t.Context(), tt.args.imageID, tt.args.imageInfo)
 			if tt.wantErr != "" {
-				require.NotNil(t, err, tt.name)
-				assert.Contains(t, err.Error(), tt.wantErr, tt.name)
+				require.ErrorContains(t, err, tt.wantErr, tt.name)
 				return
-			} else {
-				assert.NoError(t, err, tt.name)
 			}
+			require.NoError(t, err, tt.name)
 		})
 	}
 }
@@ -196,15 +208,16 @@ func TestRemoteCache_PutBlob(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := cache.NewRemoteCache(cache.RemoteURL(ts.URL), tt.args.customHeaders)
-			err := c.PutBlob(tt.args.diffID, tt.args.layerInfo)
+			c := cache.NewRemoteCache(t.Context(), cache.RemoteOptions{
+				ServerAddr:    ts.URL,
+				CustomHeaders: tt.args.customHeaders,
+			})
+			err := c.PutBlob(t.Context(), tt.args.diffID, tt.args.layerInfo)
 			if tt.wantErr != "" {
-				require.NotNil(t, err, tt.name)
-				assert.Contains(t, err.Error(), tt.wantErr, tt.name)
+				require.ErrorContains(t, err, tt.wantErr, tt.name)
 				return
-			} else {
-				assert.NoError(t, err, tt.name)
 			}
+			require.NoError(t, err, tt.name)
 		})
 	}
 }
@@ -274,18 +287,69 @@ func TestRemoteCache_MissingBlobs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := cache.NewRemoteCache(cache.RemoteURL(ts.URL), tt.args.customHeaders)
-			gotMissingImage, gotMissingLayerIDs, err := c.MissingBlobs(tt.args.imageID, tt.args.layerIDs)
+			c := cache.NewRemoteCache(t.Context(), cache.RemoteOptions{
+				ServerAddr:    ts.URL,
+				CustomHeaders: tt.args.customHeaders,
+			})
+			gotMissingImage, gotMissingLayerIDs, err := c.MissingBlobs(t.Context(), tt.args.imageID, tt.args.layerIDs)
 			if tt.wantErr != "" {
-				require.NotNil(t, err, tt.name)
-				assert.Contains(t, err.Error(), tt.wantErr, tt.name)
+				require.ErrorContains(t, err, tt.wantErr, tt.name)
 				return
-			} else {
-				require.NoError(t, err, tt.name)
 			}
-
+			require.NoError(t, err, tt.name)
 			assert.Equal(t, tt.wantMissingImage, gotMissingImage)
 			assert.Equal(t, tt.wantMissingLayerIDs, gotMissingLayerIDs)
+		})
+	}
+}
+
+func TestRemoteCache_PutArtifactInsecure(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+	defer ts.Close()
+
+	type args struct {
+		imageID   string
+		imageInfo types.ArtifactInfo
+		insecure  bool
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr string
+	}{
+		{
+			name: "happy path",
+			args: args{
+				imageID:   "sha256:e7d92cdc71feacf90708cb59182d0df1b911f8ae022d29e8e95d75ca6a99776a",
+				imageInfo: types.ArtifactInfo{},
+				insecure:  true,
+			},
+		},
+		{
+			name: "sad path",
+			args: args{
+				imageID:   "sha256:e7d92cdc71feacf90708cb59182d0df1b911f8ae022d29e8e95d75ca6a99776a",
+				imageInfo: types.ArtifactInfo{},
+				insecure:  false,
+			},
+			wantErr: "failed to do request",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := xhttp.WithTransport(t.Context(), xhttp.NewTransport(xhttp.Options{
+				Insecure: tt.args.insecure,
+			}))
+			c := cache.NewRemoteCache(ctx, cache.RemoteOptions{
+				ServerAddr:    ts.URL,
+				CustomHeaders: nil,
+			})
+			err := c.PutArtifact(t.Context(), tt.args.imageID, tt.args.imageInfo)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err, tt.name)
 		})
 	}
 }

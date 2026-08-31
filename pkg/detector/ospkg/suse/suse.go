@@ -1,19 +1,18 @@
 package suse
 
 import (
+	"context"
 	"time"
 
-	"golang.org/x/xerrors"
-	"k8s.io/utils/clock"
-
 	version "github.com/knqyf263/go-rpm-version"
+	"golang.org/x/xerrors"
 
-	fos "github.com/aquasecurity/fanal/analyzer/os"
-	ftypes "github.com/aquasecurity/fanal/types"
-	dbTypes "github.com/aquasecurity/trivy-db/pkg/types"
+	"github.com/aquasecurity/trivy-db/pkg/db"
 	susecvrf "github.com/aquasecurity/trivy-db/pkg/vulnsrc/suse-cvrf"
+	osver "github.com/aquasecurity/trivy/pkg/detector/ospkg/version"
+	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
 	"github.com/aquasecurity/trivy/pkg/log"
-	"github.com/aquasecurity/trivy/pkg/scanner/utils"
+	"github.com/aquasecurity/trivy/pkg/scan/utils"
 	"github.com/aquasecurity/trivy/pkg/types"
 )
 
@@ -38,10 +37,27 @@ var (
 		"12.5": time.Date(2024, 10, 31, 23, 59, 59, 0, time.UTC),
 		"15":   time.Date(2019, 12, 31, 23, 59, 59, 0, time.UTC),
 		"15.1": time.Date(2021, 1, 31, 23, 59, 59, 0, time.UTC),
-		// 6 months after SLES 15 SP3 release
-		"15.2": time.Date(2021, 10, 31, 23, 59, 59, 0, time.UTC),
-		// 6 months after SLES 15 SP4 release
-		// "15.3":   time.Date(2028, 7, 31, 23, 59, 59, 0, time.UTC),
+		"15.2": time.Date(2021, 12, 31, 23, 59, 59, 0, time.UTC),
+		"15.3": time.Date(2022, 12, 31, 23, 59, 59, 0, time.UTC),
+		"15.4": time.Date(2023, 12, 31, 23, 59, 59, 0, time.UTC),
+		"15.5": time.Date(2024, 12, 31, 23, 59, 59, 0, time.UTC),
+		"15.6": time.Date(2025, 12, 31, 23, 59, 59, 0, time.UTC),
+		"15.7": time.Date(2031, 7, 31, 23, 59, 59, 0, time.UTC),
+		"16.0": time.Date(2027, 11, 30, 23, 59, 59, 0, time.UTC),
+		"16.1": time.Date(2028, 11, 30, 23, 59, 59, 0, time.UTC),
+	}
+	slemicroEolDates = map[string]time.Time{
+		// Source: https://www.suse.com/lifecycle/
+		"5.0": time.Date(2022, 3, 31, 23, 59, 59, 0, time.UTC),
+		"5.1": time.Date(2025, 10, 31, 23, 59, 59, 0, time.UTC),
+		"5.2": time.Date(2026, 4, 30, 23, 59, 59, 0, time.UTC),
+		"5.3": time.Date(2026, 10, 30, 23, 59, 59, 0, time.UTC),
+		"5.4": time.Date(2027, 4, 30, 23, 59, 59, 0, time.UTC),
+		"5.5": time.Date(2027, 10, 31, 23, 59, 59, 0, time.UTC),
+		"6.0": time.Date(2028, 6, 30, 23, 59, 59, 0, time.UTC),
+		"6.1": time.Date(2028, 11, 30, 23, 59, 59, 0, time.UTC),
+		// 6.2 will be released late 2025
+		// "6.2": time.Date(2029, 11, 30, 23, 59, 59, 0, time.UTC),
 	}
 
 	opensuseEolDates = map[string]time.Time{
@@ -52,51 +68,66 @@ var (
 		"15.0": time.Date(2019, 12, 3, 23, 59, 59, 0, time.UTC),
 		"15.1": time.Date(2020, 11, 30, 23, 59, 59, 0, time.UTC),
 		"15.2": time.Date(2021, 11, 30, 23, 59, 59, 0, time.UTC),
+		"15.3": time.Date(2022, 11, 30, 23, 59, 59, 0, time.UTC),
+		"15.4": time.Date(2023, 11, 30, 23, 59, 59, 0, time.UTC),
+		"15.5": time.Date(2024, 12, 31, 23, 59, 59, 0, time.UTC),
+		"15.6": time.Date(2025, 12, 31, 23, 59, 59, 0, time.UTC),
+		"16.0": time.Date(2027, 10, 31, 23, 59, 59, 0, time.UTC),
 	}
 )
 
-// Scanner implements suse scanner
-type Scanner struct {
-	vs    dbTypes.VulnSrc
-	clock clock.Clock
-}
-
-// Type to define SUSE type
+// Type defines SUSE type
 type Type int
 
 const (
 	// SUSEEnterpriseLinux is Linux Enterprise version
 	SUSEEnterpriseLinux Type = iota
+	// SUSE Linux Enterprise Micro is the micro series
+	SUSEEnterpriseLinuxMicro
 	// OpenSUSE for open versions
 	OpenSUSE
+	OpenSUSETumbleweed
 )
+
+// Scanner implements the SUSE scanner
+type Scanner struct {
+	vs susecvrf.VulnSrc
+}
 
 // NewScanner is the factory method for Scanner
 func NewScanner(t Type) *Scanner {
 	switch t {
 	case SUSEEnterpriseLinux:
 		return &Scanner{
-			vs:    susecvrf.NewVulnSrc(susecvrf.SUSEEnterpriseLinux),
-			clock: clock.RealClock{},
+			vs: susecvrf.NewVulnSrc(susecvrf.SUSEEnterpriseLinux),
+		}
+	case SUSEEnterpriseLinuxMicro:
+		return &Scanner{
+			vs: susecvrf.NewVulnSrc(susecvrf.SUSEEnterpriseLinuxMicro),
 		}
 	case OpenSUSE:
 		return &Scanner{
-			vs:    susecvrf.NewVulnSrc(susecvrf.OpenSUSE),
-			clock: clock.RealClock{},
+			vs: susecvrf.NewVulnSrc(susecvrf.OpenSUSE),
+		}
+	case OpenSUSETumbleweed:
+		return &Scanner{
+			vs: susecvrf.NewVulnSrc(susecvrf.OpenSUSETumbleweed),
 		}
 	}
 	return nil
 }
 
 // Detect scans and returns the vulnerabilities
-func (s *Scanner) Detect(osVer string, pkgs []ftypes.Package) ([]types.DetectedVulnerability, error) {
-	log.Logger.Info("Detecting SUSE vulnerabilities...")
-	log.Logger.Debugf("SUSE: os version: %s", osVer)
-	log.Logger.Debugf("SUSE: the number of packages: %d", len(pkgs))
+func (s *Scanner) Detect(ctx context.Context, osVer string, _ *ftypes.Repository, pkgs []ftypes.Package) ([]types.DetectedVulnerability, error) {
+	log.InfoContext(ctx, "Detecting vulnerabilities...", log.String("os_version", osVer),
+		log.Int("pkg_num", len(pkgs)))
 
 	var vulns []types.DetectedVulnerability
 	for _, pkg := range pkgs {
-		advisories, err := s.vs.Get(osVer, pkg.SrcName)
+		advisories, err := s.vs.Get(db.GetParams{
+			Release: osVer,
+			PkgName: pkg.Name,
+		})
 		if err != nil {
 			return nil, xerrors.Errorf("failed to get SUSE advisory: %w", err)
 		}
@@ -107,9 +138,13 @@ func (s *Scanner) Detect(osVer string, pkgs []ftypes.Package) ([]types.DetectedV
 			fixedVersion := version.NewVersion(adv.FixedVersion)
 			vuln := types.DetectedVulnerability{
 				VulnerabilityID:  adv.VulnerabilityID,
+				PkgID:            pkg.ID,
 				PkgName:          pkg.Name,
 				InstalledVersion: installed,
+				PkgIdentifier:    pkg.Identifier,
 				Layer:            pkg.Layer,
+				Custom:           adv.Custom,
+				DataSource:       adv.DataSource,
 			}
 			if installedVersion.LessThan(fixedVersion) {
 				vuln.FixedVersion = adv.FixedVersion
@@ -121,20 +156,16 @@ func (s *Scanner) Detect(osVer string, pkgs []ftypes.Package) ([]types.DetectedV
 }
 
 // IsSupportedVersion checks if OSFamily can be scanned using SUSE scanner
-func (s *Scanner) IsSupportedVersion(osFamily, osVer string) bool {
-	var eolDate time.Time
-	var ok bool
-
-	if osFamily == fos.SLES {
-		eolDate, ok = slesEolDates[osVer]
-	} else if osFamily == fos.OpenSUSELeap {
-		eolDate, ok = opensuseEolDates[osVer]
+func (s *Scanner) IsSupportedVersion(ctx context.Context, osFamily ftypes.OSType, osVer string) bool {
+	if osFamily == ftypes.SLES {
+		return osver.Supported(ctx, slesEolDates, osFamily, osVer)
 	}
-
-	if !ok {
-		log.Logger.Warnf("This OS version is not on the EOL list: %s %s", osFamily, osVer)
-		return false
+	if osFamily == ftypes.SLEMicro {
+		return osver.Supported(ctx, slemicroEolDates, osFamily, osVer)
 	}
-
-	return s.clock.Now().Before(eolDate)
+	// tumbleweed is a rolling release, it has no version and no eol
+	if osFamily == ftypes.OpenSUSETumbleweed {
+		return true
+	}
+	return osver.Supported(ctx, opensuseEolDates, osFamily, osVer)
 }

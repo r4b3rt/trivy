@@ -1,368 +1,321 @@
-package db
+package db_test
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
-	"io/ioutil"
-	"os"
+	"bytes"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/aquasecurity/trivy/pkg/github"
-	"github.com/aquasecurity/trivy/pkg/indicator"
-
-	"github.com/spf13/afero"
-
+	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"golang.org/x/xerrors"
-
-	"k8s.io/utils/clock"
-	clocktesting "k8s.io/utils/clock/testing"
-
-	"github.com/aquasecurity/trivy-db/pkg/db"
-	"github.com/stretchr/testify/assert"
+	"github.com/aquasecurity/trivy-db/pkg/metadata"
+	"github.com/aquasecurity/trivy/internal/dbtest"
+	"github.com/aquasecurity/trivy/pkg/clock"
+	"github.com/aquasecurity/trivy/pkg/db"
+	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
+	"github.com/aquasecurity/trivy/pkg/log"
 )
 
 func TestClient_NeedsUpdate(t *testing.T) {
 	timeNextUpdateDay1 := time.Date(2019, 9, 1, 0, 0, 0, 0, time.UTC)
 	timeNextUpdateDay2 := time.Date(2019, 10, 2, 0, 0, 0, 0, time.UTC)
 
-	testCases := []struct {
-		name          string
-		light         bool
-		skip          bool
-		clock         clock.Clock
-		metadata      db.Metadata
-		expected      bool
-		expectedError error
+	timeDownloadAt := time.Date(2019, 9, 30, 22, 30, 0, 0, time.UTC)
+
+	tests := []struct {
+		name         string
+		skip         bool
+		dbFileExists bool
+		metadata     metadata.Metadata
+		want         bool
+		wantLogs     []string
+		wantErr      string
 	}{
 		{
-			name:  "happy path",
-			light: false,
-			clock: clocktesting.NewFakeClock(time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC)),
-			metadata: db.Metadata{
-				Version:    1,
-				Type:       db.TypeFull,
-				NextUpdate: timeNextUpdateDay1,
-			},
-			expected: true,
-		},
-		{
-			name:     "happy path for first run",
-			light:    false,
-			clock:    clocktesting.NewFakeClock(time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC)),
-			metadata: db.Metadata{},
-			expected: true,
-		},
-		{
-			name:  "happy path with different type",
-			light: true,
-			clock: clocktesting.NewFakeClock(time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC)),
-			metadata: db.Metadata{
-				Version:    1,
-				Type:       db.TypeFull,
-				NextUpdate: timeNextUpdateDay1,
-			},
-			expected: true,
-		},
-		{
-			name:  "happy path with old schema version",
-			light: true,
-			clock: clocktesting.NewFakeClock(time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC)),
-			metadata: db.Metadata{
-				Version:    0,
-				Type:       db.TypeFull,
-				NextUpdate: timeNextUpdateDay1,
-			},
-			expected: true,
-		},
-		{
-			name:  "happy path with --skip-update",
-			light: false,
-			clock: clocktesting.NewFakeClock(time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC)),
-			metadata: db.Metadata{
-				Version:    1,
-				Type:       db.TypeFull,
-				NextUpdate: timeNextUpdateDay1,
-			},
-			skip:     true,
-			expected: false,
-		},
-		{
-			name:  "skip downloading DB",
-			light: false,
-			clock: clocktesting.NewFakeClock(time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC)),
-			metadata: db.Metadata{
-				Version:    1,
-				Type:       db.TypeFull,
-				NextUpdate: timeNextUpdateDay2,
-			},
-			expected: false,
-		},
-		{
-			name:  "newer schema version",
-			light: false,
-			clock: clocktesting.NewFakeClock(time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC)),
-			metadata: db.Metadata{
-				Version:    2,
-				Type:       db.TypeFull,
-				NextUpdate: timeNextUpdateDay2,
-			},
-			expectedError: xerrors.New("the version of DB schema doesn't match. Local DB: 2, Expected: 1"),
-		},
-		{
-			name:          "--skip-update on the first run",
-			light:         false,
-			clock:         clocktesting.NewFakeClock(time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC)),
-			metadata:      db.Metadata{},
-			skip:          true,
-			expectedError: xerrors.New("--skip-update cannot be specified on the first run"),
-		},
-		{
-			name:  "--skip-update with different schema version",
-			light: false,
-			clock: clocktesting.NewFakeClock(time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC)),
-			metadata: db.Metadata{
-				Version:    0,
-				Type:       db.TypeFull,
-				NextUpdate: timeNextUpdateDay1,
-			},
-			skip:          true,
-			expectedError: xerrors.New("--skip-update cannot be specified with the old DB"),
-		},
-		{
-			name:  "happy with old DownloadedAt",
-			light: false,
-			clock: clocktesting.NewFakeClock(time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC)),
-			metadata: db.Metadata{
-				Version:      1,
-				Type:         db.TypeFull,
+			name:         "happy path",
+			dbFileExists: true,
+			metadata: metadata.Metadata{
+				Version:      db.SchemaVersion,
 				NextUpdate:   timeNextUpdateDay1,
-				DownloadedAt: time.Date(2019, 9, 30, 22, 30, 0, 0, time.UTC),
+				DownloadedAt: timeDownloadAt,
 			},
-			expected: true,
+			want: true,
 		},
 		{
-			name:  "skip downloading DB with recent DownloadedAt",
-			light: false,
-			clock: clocktesting.NewFakeClock(time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC)),
-			metadata: db.Metadata{
-				Version:      1,
-				Type:         db.TypeFull,
+			name:         "happy path for first run",
+			dbFileExists: true,
+			metadata:     metadata.Metadata{},
+			want:         true,
+			wantLogs: []string{
+				"There is no valid metadata file",
+			},
+		},
+		{
+			name:         "happy path for first run without trivy.db",
+			dbFileExists: false,
+			want:         true,
+			wantLogs: []string{
+				"There is no db file",
+				"There is no valid metadata file",
+			},
+		},
+		{
+			name:         "happy path with old schema version",
+			dbFileExists: true,
+			metadata: metadata.Metadata{
+				Version:      0,
+				NextUpdate:   timeNextUpdateDay1,
+				DownloadedAt: timeDownloadAt,
+			},
+			want: true,
+			wantLogs: []string{
+				"The local DB schema version does not match with supported version schema.",
+			},
+		},
+		{
+			name:         "happy path with --skip-db-update",
+			dbFileExists: true,
+			metadata: metadata.Metadata{
+				Version:      db.SchemaVersion,
+				NextUpdate:   timeNextUpdateDay1,
+				DownloadedAt: timeDownloadAt,
+			},
+			skip: true,
+			want: false,
+			wantLogs: []string{
+				"Skipping DB update...",
+			},
+		},
+		{
+			name:         "skip downloading DB",
+			dbFileExists: true,
+			metadata: metadata.Metadata{
+				Version:      db.SchemaVersion,
+				NextUpdate:   timeNextUpdateDay2,
+				DownloadedAt: timeDownloadAt,
+			},
+			want: false,
+			wantLogs: []string{
+				"DB update was skipped because the local DB is the latest",
+			},
+		},
+		{
+			name:         "newer schema version",
+			dbFileExists: true,
+			metadata: metadata.Metadata{
+				Version:      db.SchemaVersion + 1,
+				NextUpdate:   timeNextUpdateDay2,
+				DownloadedAt: timeDownloadAt,
+			},
+			wantErr: fmt.Sprintf("the version of DB schema doesn't match. Local DB: %d, Expected: %d",
+				db.SchemaVersion+1, db.SchemaVersion),
+			wantLogs: []string{
+				"Trivy version is old. Update to the latest version.",
+			},
+		},
+		{
+			name:         "--skip-db-update without trivy.db on the first run",
+			dbFileExists: false,
+			skip:         true,
+			wantErr:      "--skip-db-update cannot be specified on the first run",
+			wantLogs: []string{
+				"There is no db file",
+				"There is no valid metadata file",
+				"The first run cannot skip downloading DB",
+			},
+		},
+		{
+			name:         "--skip-db-update without metadata.json on the first run",
+			dbFileExists: true,
+			metadata:     metadata.Metadata{},
+			skip:         true,
+			wantErr:      "--skip-db-update cannot be specified on the first run",
+			wantLogs: []string{
+				"There is no valid metadata file",
+				"The first run cannot skip downloading DB",
+			},
+		},
+		{
+			name:         "--skip-db-update with different schema version",
+			dbFileExists: true,
+			metadata: metadata.Metadata{
+				Version:      0,
+				NextUpdate:   timeNextUpdateDay1,
+				DownloadedAt: timeDownloadAt,
+			},
+			skip: true,
+			wantErr: fmt.Sprintf("--skip-db-update cannot be specified with the old DB schema. Local DB: %d, Expected: %d",
+				0, db.SchemaVersion),
+			wantLogs: []string{
+				"The local DB has an old schema version which is not supported by the current version of Trivy CLI. DB needs to be updated.",
+			},
+		},
+		{
+			name:         "happy with old DownloadedAt",
+			dbFileExists: true,
+			metadata: metadata.Metadata{
+				Version:      db.SchemaVersion,
+				NextUpdate:   timeNextUpdateDay1,
+				DownloadedAt: timeDownloadAt,
+			},
+			want: true,
+		},
+		{
+			name:         "skip downloading DB with recent DownloadedAt",
+			dbFileExists: true,
+			metadata: metadata.Metadata{
+				Version:      db.SchemaVersion,
 				NextUpdate:   timeNextUpdateDay1,
 				DownloadedAt: time.Date(2019, 9, 30, 23, 30, 0, 0, time.UTC),
 			},
-			expected: false,
+			want: false,
+			wantLogs: []string{
+				"DB update was skipped because the local DB was downloaded during the last hour",
+			},
+		},
+		{
+			name:         "DownloadedAt is zero, skip is false",
+			dbFileExists: true,
+			skip:         false,
+			metadata: metadata.Metadata{
+				Version:      db.SchemaVersion,
+				DownloadedAt: time.Time{}, // zero time
+				NextUpdate:   timeNextUpdateDay1,
+			},
+			want: true,
+			wantLogs: []string{
+				"Trivy DB may be corrupted and will be re-downloaded. If you manually downloaded DB - use the `--skip-db-update` flag to skip updating DB.",
+			},
+		},
+		{
+			name:         "DownloadedAt is zero, skip is true",
+			dbFileExists: true,
+			skip:         true,
+			metadata: metadata.Metadata{
+				Version:      db.SchemaVersion,
+				DownloadedAt: time.Time{}, // zero time
+				NextUpdate:   timeNextUpdateDay1,
+			},
+			want: false,
+			wantLogs: []string{
+				"Skipping DB update...",
+			},
+		},
+		{
+			name:         "DownloadedAt is zero, skip is true, old schema version",
+			dbFileExists: true,
+			skip:         true,
+			metadata: metadata.Metadata{
+				Version:      0,
+				DownloadedAt: time.Time{}, // zero time
+				NextUpdate:   timeNextUpdateDay1,
+			},
+			wantErr: "--skip-db-update cannot be specified with the old DB schema. Local DB: 0, Expected: 2",
+			want:    false,
+			wantLogs: []string{
+				"The local DB has an old schema version which is not supported by the current version of Trivy CLI. DB needs to be updated.",
+			},
+		},
+		{
+			name:         "trivy.db is missing but metadata with recent DownloadedAt",
+			dbFileExists: false,
+			metadata: metadata.Metadata{
+				Version:      db.SchemaVersion,
+				NextUpdate:   timeNextUpdateDay1,
+				DownloadedAt: time.Date(2019, 9, 30, 23, 30, 0, 0, time.UTC),
+			},
+			want: true,
+			wantLogs: []string{
+				"There is no db file",
+			},
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			fs := afero.NewMemMapFs()
-			metadata := NewMetadata(fs, "/cache")
-			if tc.metadata != (db.Metadata{}) {
-				b, err := json.Marshal(tc.metadata)
-				require.NoError(t, err)
-				err = afero.WriteFile(fs, metadata.filePath, b, 0600)
-				require.NoError(t, err)
-			}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := bytes.NewBuffer(nil)
+			logger := log.New(log.NewHandler(out, &log.Options{Level: log.LevelDebug}))
+			log.SetDefault(logger)
 
-			client := Client{
-				clock:    tc.clock,
-				metadata: metadata,
-			}
+			// Initialize DB with metadata and optionally create DB file
+			dbDir := dbtest.InitWithMetadata(t, tt.metadata, tt.dbFileExists)
+			t.Cleanup(func() {
+				require.NoError(t, db.Close())
+			})
 
-			needsUpdate, err := client.NeedsUpdate("test", tc.light, tc.skip)
+			// Set a fake time
+			ctx := clock.With(t.Context(), time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC))
+
+			client := db.NewClient(dbDir, true)
+			needsUpdate, err := client.NeedsUpdate(ctx, "test", tt.skip)
+
+			// Compare log messages
+			require.Len(t, lo.Compact(strings.Split(out.String(), "\n")), len(tt.wantLogs))
+			for _, logMsg := range tt.wantLogs {
+				assert.Contains(t, out.String(), logMsg)
+			}
 
 			switch {
-			case tc.expectedError != nil:
-				assert.EqualError(t, err, tc.expectedError.Error(), tc.name)
+			case tt.wantErr != "":
+				require.ErrorContains(t, err, tt.wantErr, tt.name)
 			default:
-				assert.NoError(t, err, tc.name)
+				require.NoError(t, err, tt.name)
 			}
 
-			assert.Equal(t, tc.expected, needsUpdate)
+			assert.Equal(t, tt.want, needsUpdate)
 		})
 	}
 }
 
 func TestClient_Download(t *testing.T) {
-	testCases := []struct {
-		name            string
-		light           bool
-		downloadDB      []github.DownloadDBExpectation
-		expectedContent []byte
-		expectedError   error
+	tests := []struct {
+		name    string
+		input   string
+		want    metadata.Metadata
+		wantErr string
 	}{
 		{
 			name:  "happy path",
-			light: false,
-			downloadDB: []github.DownloadDBExpectation{
-				{
-					Args: github.DownloadDBInput{FileName: fullDB},
-					ReturnArgs: github.DownloadDBOutput{
-						FileName: "testdata/test.db.gz",
-					},
-				},
+			input: "testdata/db.tar.gz",
+			want: metadata.Metadata{
+				Version:      1,
+				NextUpdate:   time.Date(3000, 1, 1, 18, 5, 43, 198355188, time.UTC),
+				UpdatedAt:    time.Date(3000, 1, 1, 12, 5, 43, 198355588, time.UTC),
+				DownloadedAt: time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC),
 			},
 		},
 		{
-			name:  "DownloadDB returns an error",
-			light: false,
-			downloadDB: []github.DownloadDBExpectation{
-				{
-					Args: github.DownloadDBInput{FileName: fullDB},
-					ReturnArgs: github.DownloadDBOutput{
-						Err: xerrors.New("download failed"),
-					},
-				},
-			},
-			expectedError: xerrors.New("failed to download vulnerability DB: download failed"),
-		},
-		{
-			name:  "invalid gzip",
-			light: false,
-			downloadDB: []github.DownloadDBExpectation{
-				{
-					Args: github.DownloadDBInput{FileName: fullDB},
-					ReturnArgs: github.DownloadDBOutput{
-						FileName: "testdata/invalid.db.gz",
-					},
-				},
-			},
-			expectedError: xerrors.New("invalid gzip file: unexpected EOF"),
+			name:    "invalid gzip",
+			input:   "testdata/trivy.db",
+			wantErr: "OCI artifact error: failed to download vulnerability DB",
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			mockConfig := new(mockDbOperation)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Set a fake time
+			ctx := clock.With(t.Context(), time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC))
 
-			mockGitHubClient, err := github.NewMockClient(tc.downloadDB)
-			require.NoError(t, err, tc.name)
+			// Fake DB
+			art := dbtest.NewFakeDB(t, tt.input, dbtest.FakeDBOptions{})
 
-			fs := afero.NewMemMapFs()
-			metadata := NewMetadata(fs, "/cache")
-
-			dir, err := ioutil.TempDir("", "db")
-			require.NoError(t, err, tc.name)
-			defer os.RemoveAll(dir)
-
-			pb := indicator.NewProgressBar(true)
-			client := NewClient(mockConfig, mockGitHubClient, pb, nil, metadata)
-			ctx := context.Background()
-			err = client.Download(ctx, dir, tc.light)
-
-			switch {
-			case tc.expectedError != nil:
-				assert.EqualError(t, err, tc.expectedError.Error(), tc.name)
-			default:
-				assert.NoError(t, err, tc.name)
+			dbDir := db.Dir(t.TempDir())
+			client := db.NewClient(dbDir, true, db.WithOCIArtifact(art))
+			err := client.Download(ctx, dbDir, ftypes.RegistryOptions{})
+			if tt.wantErr != "" {
+				assert.ErrorContains(t, err, tt.wantErr)
+				return
 			}
+			require.NoError(t, err)
 
-			mockGitHubClient.AssertExpectations(t)
-		})
-	}
-}
+			meta := metadata.NewClient(dbDir)
+			got, err := meta.Get()
+			require.NoError(t, err)
 
-func TestClient_UpdateMetadata(t *testing.T) {
-	timeDownloadedAt := clocktesting.NewFakeClock(time.Date(2019, 10, 1, 0, 0, 0, 0, time.UTC))
-	testCases := []struct {
-		name                     string
-		clock                    clock.Clock
-		getMetadataExpectation   dbOperationGetMetadataExpectation
-		storeMetadataExpectation dbOperationStoreMetadataExpectation
-		expectedError            error
-	}{
-		{
-			name:  "happy path",
-			clock: timeDownloadedAt,
-			getMetadataExpectation: dbOperationGetMetadataExpectation{
-				Returns: dbOperationGetMetadataReturns{
-					Metadata: db.Metadata{
-						Version:    1,
-						Type:       1,
-						NextUpdate: time.Date(2020, 4, 30, 23, 59, 59, 0, time.UTC),
-						UpdatedAt:  time.Date(2006, 4, 30, 23, 59, 59, 0, time.UTC),
-					},
-					Err: nil,
-				},
-			},
-			storeMetadataExpectation: dbOperationStoreMetadataExpectation{
-				Metadata: db.Metadata{
-					Version:      1,
-					Type:         1,
-					NextUpdate:   time.Date(2020, 4, 30, 23, 59, 59, 0, time.UTC),
-					UpdatedAt:    time.Date(2006, 4, 30, 23, 59, 59, 0, time.UTC),
-					DownloadedAt: timeDownloadedAt.Now(),
-				},
-			},
-		},
-		{
-			name:  "sad path, get metadata fails",
-			clock: timeDownloadedAt,
-			getMetadataExpectation: dbOperationGetMetadataExpectation{
-				Returns: dbOperationGetMetadataReturns{
-					Err: errors.New("get metadata failed"),
-				},
-			},
-			expectedError: errors.New("unable to get metadata: get metadata failed"),
-		},
-		{
-			name:  "sad path, store metadata fails",
-			clock: timeDownloadedAt,
-			getMetadataExpectation: dbOperationGetMetadataExpectation{
-				Returns: dbOperationGetMetadataReturns{
-					Metadata: db.Metadata{
-						Version:    1,
-						Type:       1,
-						NextUpdate: time.Date(2020, 4, 30, 23, 59, 59, 0, time.UTC),
-						UpdatedAt:  time.Date(2006, 4, 30, 23, 59, 59, 0, time.UTC),
-					},
-					Err: nil,
-				},
-			},
-			storeMetadataExpectation: dbOperationStoreMetadataExpectation{
-				Metadata: db.Metadata{
-					Version:      1,
-					Type:         1,
-					NextUpdate:   time.Date(2020, 4, 30, 23, 59, 59, 0, time.UTC),
-					UpdatedAt:    time.Date(2006, 4, 30, 23, 59, 59, 0, time.UTC),
-					DownloadedAt: timeDownloadedAt.Now(),
-				},
-				Returns: dbOperationStoreMetadataReturns{
-					Err: errors.New("store metadata failed"),
-				},
-			},
-			expectedError: errors.New("failed to store metadata: store metadata failed"),
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			mockConfig := new(mockDbOperation)
-			mockConfig.ApplyGetMetadataExpectation(tc.getMetadataExpectation)
-			mockConfig.ApplyStoreMetadataExpectation(tc.storeMetadataExpectation)
-
-			fs := afero.NewMemMapFs()
-			metadata := NewMetadata(fs, "/cache")
-
-			dir, err := ioutil.TempDir("", "db")
-			require.NoError(t, err, tc.name)
-			defer os.RemoveAll(dir)
-
-			pb := indicator.NewProgressBar(true)
-			client := NewClient(mockConfig, nil, pb, tc.clock, metadata)
-
-			err = client.UpdateMetadata(dir)
-			switch {
-			case tc.expectedError != nil:
-				assert.EqualError(t, err, tc.expectedError.Error(), tc.name)
-			default:
-				assert.NoError(t, err, tc.name)
-			}
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

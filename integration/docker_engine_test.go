@@ -1,340 +1,412 @@
-// +build integration
+//go:build integration
 
 package integration
 
 import (
-	"context"
-	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/aquasecurity/trivy/pkg/commands"
+	"github.com/aquasecurity/trivy/internal/testutil"
+	"github.com/aquasecurity/trivy/pkg/types"
 )
 
-func TestRun_WithDockerEngine(t *testing.T) {
-	testCases := []struct {
-		name                string
-		withImageSubcommand bool
-		imageTag            string
-		invalidImage        bool
-		ignoreUnfixed       bool
-		severity            []string
-		ignoreIDs           []string
-		testfile            string
-		expectedOutputFile  string
-		expectedError       string
+type overrideValues struct {
+	artifactID string
+	imageID    string
+}
+
+var (
+	alpineIDs = overrideValues{
+		artifactID: "sha256:243ee36277d8f2a79a980373843fe7834a484a024cd7e647d6db3d0434335e6b",
+		imageID:    "sha256:e1b6a1e6b446c39fa12f218e3050e59b47a870de1b1afca840dce65e913b196f",
+	}
+
+	centOS7IDs = overrideValues{
+		artifactID: "sha256:14bd400fe6aba45977110fadb29ab402fed2356ae68d071ed8e6ffe95ec4e387",
+		imageID:    "sha256:c51c4bac51fc7a3d6b6035336eb6a3cc9d57113dd1c10b2109e14dfc3a509740",
+	}
+
+	debianBusterIDs = overrideValues{
+		artifactID: "sha256:542c2a0b2641139673b479e67ae5bd3e6c62559e3fc882dcf2679b6b0ffb9837",
+		imageID:    "sha256:c46a5c17bdd6698cc02e4dd15d033898840e1e0f8016dcc86bb1f5d3239a9cb6",
+	}
+
+	ubuntu1804IDs = overrideValues{
+		artifactID: "sha256:133f1c0f30523d26ea2686df45a950b80fb957f8da83c10c01b95df3acfeedc6",
+		imageID:    "sha256:50c3ea3e170e9e02f880dd630d46f6bafd0966066b7d5ff1424e4268412c5344",
+	}
+)
+
+// TestDockerEngine tests scanning images via Docker Engine API.
+//
+// Golden files are shared with TestTar.
+func TestDockerEngine(t *testing.T) {
+	if *update {
+		t.Skipf("Skipping TestDockerEngine when -update flag is set. Golden files should be updated via TestTar.")
+	}
+
+	tests := []struct {
+		name          string
+		invalidImage  bool
+		ignoreUnfixed bool
+		ignoreStatus  []string
+		severity      []string
+		ignoreIDs     []string
+		maxImageSize  string
+		input         string
+		override      overrideValues
+		golden        string
+		wantErr       string
 	}{
-		// All of these cases should pass for either
-		// $ trivy <args>
-		// $ trivy image <args>
 		{
-			name:               "happy path, valid image path, alpine:3.10",
-			imageTag:           "alpine:3.10",
-			expectedOutputFile: "testdata/alpine-310.json.golden",
-			testfile:           "testdata/fixtures/alpine-310.tar.gz",
+			name:     "alpine:3.9",
+			input:    "testdata/fixtures/images/alpine-39.tar.gz",
+			golden:   goldenAlpine39,
+			override: alpineIDs,
 		},
 		{
-			name:                "happy path, valid image path, with image subcommand, alpine:3.10",
-			withImageSubcommand: true,
-			imageTag:            "alpine:3.10",
-			expectedOutputFile:  "testdata/alpine-310.json.golden",
-			testfile:            "testdata/fixtures/alpine-310.tar.gz",
+			name:         "alpine:3.9, with max image size",
+			maxImageSize: "100mb",
+			input:        "testdata/fixtures/images/alpine-39.tar.gz",
+			golden:       goldenAlpine39,
+			override:     alpineIDs,
 		},
 		{
-			name:               "happy path, valid image path, alpine:3.10, ignore unfixed",
-			ignoreUnfixed:      true,
-			imageTag:           "alpine:3.10",
-			expectedOutputFile: "testdata/alpine-310-ignore-unfixed.json.golden",
-			testfile:           "testdata/fixtures/alpine-310.tar.gz",
+			name: "alpine:3.9, with high and critical severity",
+			severity: []string{
+				"HIGH",
+				"CRITICAL",
+			},
+			input:    "testdata/fixtures/images/alpine-39.tar.gz",
+			golden:   goldenAlpine39HighCritical,
+			override: alpineIDs,
 		},
 		{
-			name:               "happy path, valid image path, alpine:3.10, ignore unfixed, with medium and high severity",
-			ignoreUnfixed:      true,
-			severity:           []string{"MEDIUM", "HIGH"},
-			imageTag:           "alpine:3.10",
-			expectedOutputFile: "testdata/alpine-310-medium-high.json.golden",
-			testfile:           "testdata/fixtures/alpine-310.tar.gz",
+			name: "alpine:3.9, with .trivyignore",
+			ignoreIDs: []string{
+				"CVE-2019-1549",
+				"CVE-2019-14697",
+			},
+			input:    "testdata/fixtures/images/alpine-39.tar.gz",
+			golden:   goldenAlpine39IgnoreCVEIDs,
+			override: alpineIDs,
 		},
 		{
-			name:               "happy path, valid image path, alpine:3.10, with .trivyignore",
-			imageTag:           "alpine:3.10",
-			ignoreIDs:          []string{"CVE-2019-1549", "CVE-2019-1563"},
-			expectedOutputFile: "testdata/alpine-310-ignore-cveids.json.golden",
-			testfile:           "testdata/fixtures/alpine-310.tar.gz",
+			name:   "alpine:3.10",
+			input:  "testdata/fixtures/images/alpine-310.tar.gz",
+			golden: goldenAlpine310JSON,
+			override: overrideValues{
+				artifactID: "sha256:61bd381a03b7e96b5950ac465077b9b104cd7ac5a38aa57b64ae0c99bb2470d0",
+				imageID:    "sha256:f12582b2f2190f350e3904462c1c23aaf366b4f76705e97b199f9bbded1d816a",
+			},
 		},
 		{
-			name:               "happy path, valid image path, alpine:3.9",
-			imageTag:           "alpine:3.9",
-			expectedOutputFile: "testdata/alpine-39.json.golden",
-			testfile:           "testdata/fixtures/alpine-39.tar.gz",
+			name:   "amazonlinux:1",
+			input:  "testdata/fixtures/images/amazon-1.tar.gz",
+			golden: goldenAmazon1,
+			override: overrideValues{
+				artifactID: "sha256:372784e31f6a7c4efc3d433e193d668ac61d4e1533e308267cdf1bffb7d0dafb",
+				imageID:    "sha256:83b15d0365d6ff7b7c45595bf29a999cdcc03d8d7899fcb74639319ad3f9f18a",
+			},
 		},
 		{
-			name:               "happy path, valid image path, amazonlinux:1",
-			imageTag:           "amazonlinux:1",
-			expectedOutputFile: "testdata/amazon-1.json.golden",
-			testfile:           "testdata/fixtures/amazon-1.tar.gz",
+			name:   "amazonlinux:2",
+			input:  "testdata/fixtures/images/amazon-2.tar.gz",
+			golden: goldenAmazon2,
+			override: overrideValues{
+				artifactID: "sha256:9ed60ac6eedb461967fd109f8721d8761379d6f38a6ea770d10fbc9a280dd1a6",
+				imageID:    "sha256:b553b1064cde62ceee90a8575f4954ef9adda2e45a9e712fbcc67b63114cd940",
+			},
 		},
 		{
-			name:               "happy path, valid image path, amazonlinux:2",
-			imageTag:           "amazonlinux:2",
-			expectedOutputFile: "testdata/amazon-2.json.golden",
-			testfile:           "testdata/fixtures/amazon-2.tar.gz",
+			name:   "almalinux 8",
+			input:  "testdata/fixtures/images/almalinux-8.tar.gz",
+			golden: goldenAlmaLinux8,
+			override: overrideValues{
+				artifactID: "sha256:2ef11ad6245281caff084e034208cd2a71e195405cb15396feb6d4e7cf83a587",
+				imageID:    "sha256:52318004f70433054028789494879e77893a956437fb3a4842b69a1a762e83f4",
+			},
 		},
 		{
-			name:               "happy path, valid image path, centos:6",
-			imageTag:           "centos:6",
-			expectedOutputFile: "testdata/centos-6.json.golden",
-			testfile:           "testdata/fixtures/centos-6.tar.gz",
+			name:   "rocky linux 8",
+			input:  "testdata/fixtures/images/rockylinux-8.tar.gz",
+			golden: goldenRockyLinux8,
+			override: overrideValues{
+				artifactID: "sha256:280a62f2a00f406b1e74187ea60f0fe95de83b9a5a5dfaef382b7c58ce6fd196",
+				imageID:    "sha256:566c2bd67e04ad98ca170128846ed3ab326ff90caad4a1715ed4f47939cc3f69",
+			},
 		},
 		{
-			name:               "happy path, valid image path, centos:7",
-			imageTag:           "centos:7",
-			expectedOutputFile: "testdata/centos-7.json.golden",
-			testfile:           "testdata/fixtures/centos-7.tar.gz",
+			name:   "centos 6",
+			input:  "testdata/fixtures/images/centos-6.tar.gz",
+			golden: goldenCentOS6,
+			override: overrideValues{
+				artifactID: "sha256:e910d8a213217aefe45b1cc7923bda2a60398f6d3e0d958926892abff9c10da4",
+				imageID:    "sha256:8b35caa27ab5e27bdf5aef411cd6ee0b6c7ad7777cb9cfcc37f2949ca273cdb5",
+			},
 		},
 		{
-			name:               "happy path, valid image path, centos:7, with --ignore-unfixed option",
-			imageTag:           "centos:7",
-			ignoreUnfixed:      true,
-			expectedOutputFile: "testdata/centos-7-ignore-unfixed.json.golden",
-			testfile:           "testdata/fixtures/centos-7.tar.gz",
+			name:     "centos 7",
+			input:    "testdata/fixtures/images/centos-7.tar.gz",
+			golden:   goldenCentOS7,
+			override: centOS7IDs,
 		},
 		{
-			name:               "happy path, valid image path, centos:7, with --ignore-unfixed option, with low and high severity",
-			imageTag:           "centos:7",
-			ignoreUnfixed:      true,
-			severity:           []string{"LOW", "HIGH"},
-			expectedOutputFile: "testdata/centos-7-low-high.json.golden",
-			testfile:           "testdata/fixtures/centos-7.tar.gz",
+			name:          "centos 7, with --ignore-unfixed option",
+			ignoreUnfixed: true,
+			input:         "testdata/fixtures/images/centos-7.tar.gz",
+			golden:        goldenCentOS7IgnoreUnfixed,
+			override:      centOS7IDs,
 		},
 		{
-			name:               "happy path, valid image path, debian:buster",
-			imageTag:           "debian:buster",
-			expectedOutputFile: "testdata/debian-buster.json.golden",
-			testfile:           "testdata/fixtures/debian-buster.tar.gz",
+			name:         "centos 7, with --ignore-status option",
+			ignoreStatus: []string{"will_not_fix"},
+			input:        "testdata/fixtures/images/centos-7.tar.gz",
+			golden:       goldenCentOS7IgnoreUnfixed,
+			override:     centOS7IDs,
 		},
 		{
-			name:               "happy path, valid image path, debian:buster, with --ignore-unfixed option",
-			ignoreUnfixed:      true,
-			imageTag:           "debian:buster",
-			expectedOutputFile: "testdata/debian-buster-ignore-unfixed.json.golden",
-			testfile:           "testdata/fixtures/debian-buster.tar.gz",
+			name:          "centos 7, with --ignore-unfixed option, with medium severity",
+			ignoreUnfixed: true,
+			severity:      []string{"MEDIUM"},
+			input:         "testdata/fixtures/images/centos-7.tar.gz",
+			golden:        goldenCentOS7Medium,
+			override:      centOS7IDs,
 		},
 		{
-			name:               "happy path, valid image path, debian:stretch",
-			imageTag:           "debian:stretch",
-			expectedOutputFile: "testdata/debian-stretch.json.golden",
-			testfile:           "testdata/fixtures/debian-stretch.tar.gz",
+			name:   "registry.redhat.io/ubi7",
+			input:  "testdata/fixtures/images/ubi-7.tar.gz",
+			golden: goldenUBI7,
+			override: overrideValues{
+				artifactID: "sha256:af6cb66f90c404bc6c3d69c3d9f16c10c272af173a236a17fd4b9fa7f791a4eb",
+				imageID:    "sha256:a80dd41cbeea43204ae0f77c7e18a39512563803f85425fc6cdab45f52158e73",
+			},
 		},
 		{
-			name:               "happy path, valid image path, distroless:base",
-			imageTag:           "gcr.io/distroless/base:latest",
-			expectedOutputFile: "testdata/distroless-base.json.golden",
-			testfile:           "testdata/fixtures/distroless-base.tar.gz",
+			name:     "debian buster/10",
+			input:    "testdata/fixtures/images/debian-buster.tar.gz",
+			golden:   goldenDebianBuster,
+			override: debianBusterIDs,
 		},
 		{
-			name:               "happy path, valid image path, distroless:base",
-			imageTag:           "gcr.io/distroless/base:latest",
-			expectedOutputFile: "testdata/distroless-base.json.golden",
-			testfile:           "testdata/fixtures/distroless-base.tar.gz",
+			name:          "debian buster/10, with --ignore-unfixed option",
+			ignoreUnfixed: true,
+			input:         "testdata/fixtures/images/debian-buster.tar.gz",
+			golden:        goldenDebianBusterIgnoreUnfixed,
+			override:      debianBusterIDs,
 		},
 		{
-			name:               "happy path, valid image path, distroless:base, with --ignore-unfixed option",
-			imageTag:           "gcr.io/distroless/base:latest",
-			ignoreUnfixed:      true,
-			expectedOutputFile: "testdata/distroless-base-ignore-unfixed.json.golden",
-			testfile:           "testdata/fixtures/distroless-base.tar.gz",
+			name:         "debian buster/10, with --ignore-status option",
+			ignoreStatus: []string{"affected"},
+			input:        "testdata/fixtures/images/debian-buster.tar.gz",
+			golden:       goldenDebianBusterIgnoreUnfixed,
+			override:     debianBusterIDs,
 		},
 		{
-			name:               "happy path, valid image path, distroless:python2.7",
-			imageTag:           "gcr.io/distroless/python2.7:latest",
-			expectedOutputFile: "testdata/distroless-python27.json.golden",
-			testfile:           "testdata/fixtures/distroless-python27.tar.gz",
+			name:   "debian stretch/9",
+			input:  "testdata/fixtures/images/debian-stretch.tar.gz",
+			golden: goldenDebianStretch,
+			override: overrideValues{
+				artifactID: "sha256:ae095a2b1168c65ba0300011f1eda9a792f3f6a2ee0b50c899be29c652fb0439",
+				imageID:    "sha256:fc77e6160638c0695323710349cb88597e451f9e4ff265e7f1fea888aead83fb",
+			},
 		},
 		{
-			name:               "happy path, valid image path, oraclelinux:6-slim",
-			imageTag:           "oraclelinux:6-slim",
-			expectedOutputFile: "testdata/oraclelinux-6-slim.json.golden",
-			testfile:           "testdata/fixtures/oraclelinux-6-slim.tar.gz",
+			name:   "distroless base",
+			input:  "testdata/fixtures/images/distroless-base.tar.gz",
+			golden: goldenDistrolessBase,
+			override: overrideValues{
+				artifactID: "sha256:50b91b7954a592a5582854a23f16ca5d8d206a70ce68eb2c84f81721546050fa",
+				imageID:    "sha256:2257d71271eb9b723b25d7dc17998ca0cf3dd3ffb145c68addebabb6956633d8",
+			},
 		},
 		{
-			name:               "happy path, valid image path, oraclelinux:7-slim",
-			imageTag:           "oraclelinux:7-slim",
-			expectedOutputFile: "testdata/oraclelinux-7-slim.json.golden",
-			testfile:           "testdata/fixtures/oraclelinux-7-slim.tar.gz",
+			name:   "distroless python2.7",
+			input:  "testdata/fixtures/images/distroless-python27.tar.gz",
+			golden: goldenDistrolessPython27,
+			override: overrideValues{
+				artifactID: "sha256:e13c0afa7d2811598be25b369cd3dc78c455fd0a5f8415993dd2f46d360ccd51",
+				imageID:    "sha256:eb04cafc9222da50d0647e515e9409712cf8c9ce0e6ea149e24cf01525dfd613",
+			},
 		},
 		{
-			name:               "happy path, valid image path, oraclelinux:8-slim",
-			imageTag:           "oraclelinux:8-slim",
-			expectedOutputFile: "testdata/oraclelinux-8-slim.json.golden",
-			testfile:           "testdata/fixtures/oraclelinux-8-slim.tar.gz",
+			name:   "oracle linux 8",
+			input:  "testdata/fixtures/images/oraclelinux-8.tar.gz",
+			golden: goldenOracleLinux8,
+			override: overrideValues{
+				artifactID: "sha256:a818222f173267637277bd66d4a3dddcd7a271ea5686d72848b2006ab4f2b999",
+				imageID:    "sha256:5bad2539f9e86fe1c81636eed263ab8166b7a6508ebaa1084ec5695fd4855fe1",
+			},
 		},
 		{
-			name:               "happy path, valid image path, ubuntu:16.04",
-			imageTag:           "ubuntu:16.04",
-			expectedOutputFile: "testdata/ubuntu-1604.json.golden",
-			testfile:           "testdata/fixtures/ubuntu-1604.tar.gz",
+			name:     "ubuntu 18.04",
+			input:    "testdata/fixtures/images/ubuntu-1804.tar.gz",
+			golden:   goldenUbuntu1804,
+			override: ubuntu1804IDs,
 		},
 		{
-			name:               "happy path, valid image path, ubuntu:18.04",
-			imageTag:           "ubuntu:18.04",
-			expectedOutputFile: "testdata/ubuntu-1804.json.golden",
-			testfile:           "testdata/fixtures/ubuntu-1804.tar.gz",
+			name:          "ubuntu 18.04, with --ignore-unfixed option",
+			ignoreUnfixed: true,
+			input:         "testdata/fixtures/images/ubuntu-1804.tar.gz",
+			golden:        goldenUbuntu1804IgnoreUnfixed,
+			override:      ubuntu1804IDs,
 		},
 		{
-			name:               "happy path, valid image path, ubuntu:18.04, with --ignore-unfixed option",
-			imageTag:           "ubuntu:18.04",
-			ignoreUnfixed:      true,
-			expectedOutputFile: "testdata/ubuntu-1804-ignore-unfixed.json.golden",
-			testfile:           "testdata/fixtures/ubuntu-1804.tar.gz",
+			name:   "opensuse leap 15.1",
+			input:  "testdata/fixtures/images/opensuse-leap-151.tar.gz",
+			golden: goldenOpenSUSELeap151,
+			override: overrideValues{
+				artifactID: "sha256:b48df6bf517580ff3b846112870f09d1a42399af52a740ce69233ba16d5228f0",
+				imageID:    "sha256:38d0b4bb21b5e2095d0ce40c69c4d24e4ae0e76bbe4a45db53afe87d2e1ba228",
+			},
 		},
 		{
-			name:               "happy path, valid image path, registry.redhat.io/ubi7",
-			imageTag:           "registry.redhat.io/ubi7",
-			expectedOutputFile: "testdata/ubi-7.json.golden",
-			testfile:           "testdata/fixtures/ubi-7.tar.gz",
+			name:   "opensuse tumbleweed",
+			input:  "testdata/fixtures/images/opensuse-tumbleweed.tar.gz",
+			golden: goldenOpenSUSETumbleweed,
+			override: overrideValues{
+				artifactID: "sha256:28c7ebf409a2ca8a1d33d5479a19a543f228baec9b22f41df7dfacd95ca6ed0e",
+				imageID:    "sha256:b59aaf21088bbdd92253b5a3d415a4f48a2103007935840a651ac691284a051e",
+			},
 		},
 		{
-			name:               "happy path, valid image path, opensuse leap 15.1",
-			imageTag:           "opensuse/leap:latest",
-			expectedOutputFile: "testdata/opensuse-leap-151.json.golden",
-			testfile:           "testdata/fixtures/opensuse-leap-151.tar.gz",
+			name:   "sle micro rancher 5.4",
+			input:  "testdata/fixtures/images/sle-micro-rancher-5.4_ndb.tar.gz",
+			golden: goldenSLMicroRancher54,
+			override: overrideValues{
+				artifactID: "sha256:6c1e0eadb53697c85176149ead4287154dfbc1dd91ef439d199a84fd7c60dc59",
+				imageID:    "sha256:6e58434b86592f28909d8fafc030694d8c6b630eeb94ad4208431b207a6acd1a",
+			},
 		},
 		{
-			name:               "happy path, valid image path, opensuse leap 42.3",
-			imageTag:           "opensuse/leap:42.3",
-			expectedOutputFile: "testdata/opensuse-leap-423.json.golden",
-			testfile:           "testdata/fixtures/opensuse-leap-423.tar.gz",
+			name:   "photon 3.0",
+			input:  "testdata/fixtures/images/photon-30.tar.gz",
+			golden: goldenPhoton30,
+			override: overrideValues{
+				artifactID: "sha256:2b7cef41f06fa33e05c64f408fcda876d57d87141aa4ee1fb8a50fb56b875b84",
+				imageID:    "sha256:0041aaabd5852bf345e8f6d70f8596c0a0ab9c15695193977bfa3abc58d3a41d",
+			},
 		},
 		{
-			name:               "happy path, valid image path, photon 1.0",
-			imageTag:           "photon:1.0-20190823",
-			expectedOutputFile: "testdata/photon-10.json.golden",
-			testfile:           "testdata/fixtures/photon-10.tar.gz",
+			name:   "CBL-Mariner 1.0",
+			input:  "testdata/fixtures/images/mariner-1.0.tar.gz",
+			golden: goldenMariner10,
+			override: overrideValues{
+				artifactID: "sha256:e85742037b190a22f7ff747e466bd66c302bbc7266f04c7518ba9ab146ca7f43",
+				imageID:    "sha256:330dd5ae6d537d2dc18e89a56409a2dab6d3afff8c6cd6e16943c1b340a828a9",
+			},
 		},
 		{
-			name:               "happy path, valid image path, photon 2.0",
-			imageTag:           "photon:2.0-20190726",
-			expectedOutputFile: "testdata/photon-20.json.golden",
-			testfile:           "testdata/fixtures/photon-20.tar.gz",
+			name:   "busybox with Cargo.lock",
+			input:  "testdata/fixtures/images/busybox-with-lockfile.tar.gz",
+			golden: goldenBusyboxWithLockfile,
+			override: overrideValues{
+				artifactID: "sha256:e0edf846fd89372b0869a4826791a1c22dd620e75e32b586bc7e7bba245793a4",
+				imageID:    "sha256:51dccb50b93f4f7d860045f19b34fd9eeca83fec890bdba10e0b706d6289a8bf",
+			},
 		},
 		{
-			name:               "happy path, valid image path, photon 3.0",
-			imageTag:           "photon:3.0-20190823",
-			expectedOutputFile: "testdata/photon-30.json.golden",
-			testfile:           "testdata/fixtures/photon-30.tar.gz",
+			name:         "sad path, invalid image",
+			invalidImage: true,
+			input:        "badimage:latest",
+			wantErr:      "unable to inspect the image (badimage:latest)",
 		},
 		{
-			name:               "buxybox with Cargo.lock integration",
-			imageTag:           "busy-cargo:latest",
-			expectedOutputFile: "testdata/busybox-with-lockfile.json.golden",
-			testfile:           "testdata/fixtures/busybox-with-lockfile.tar.gz",
-		},
-		{
-			name:          "sad path, invalid image",
-			invalidImage:  true,
-			testfile:      "badimage:latest",
-			expectedError: "unable to inspect the image (index.docker.io/library/badimage:latest)",
+			name:         "sad path, image size is larger than the maximum",
+			input:        "testdata/fixtures/images/alpine-39.tar.gz",
+			maxImageSize: "3mb",
+			wantErr:      "uncompressed layers size 5.8MB exceeds maximum allowed size 3MB",
 		},
 	}
 
-	// Copy DB file
-	cacheDir, err := gunzipDB()
-	require.NoError(t, err)
-	defer os.RemoveAll(cacheDir)
+	// Set up testing DB
+	cacheDir := initDB(t)
 
-	ctx := context.Background()
+	// Set a temp dir so that modules will not be loaded
+	t.Setenv("XDG_DATA_HOME", cacheDir)
+
+	ctx := t.Context()
 	defer ctx.Done()
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	require.NoError(t, err)
+	cli := testutil.NewDockerClient(t)
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			if !tc.invalidImage {
-				testfile, err := os.Open(tc.testfile)
-				require.NoError(t, err, tc.name)
-
-				// ensure image doesnt already exists
-				_, _ = cli.ImageRemove(ctx, tc.testfile, types.ImageRemoveOptions{
-					Force:         true,
-					PruneChildren: true,
-				})
-
-				// load image into docker engine
-				res, err := cli.ImageLoad(ctx, testfile, true)
-				require.NoError(t, err, tc.name)
-				io.Copy(ioutil.Discard, res.Body)
-
-				// tag our image to something unique
-				err = cli.ImageTag(ctx, tc.imageTag, tc.testfile)
-				require.NoError(t, err, tc.name)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			imageName := tt.input
+			if !tt.invalidImage {
+				// Removes any existing images with conflicting RepoTags and loading images
+				imageName = cli.ImageCleanLoad(t, ctx, tt.input)
 			}
 
-			of, err := ioutil.TempFile("", "integration-docker-engine-output-file-*")
-			require.NoError(t, err, tc.name)
-			defer os.Remove(of.Name())
-
-			// run trivy
-			app := commands.NewApp("dev")
-			trivyArgs := []string{"trivy"}
-			trivyArgs = append(trivyArgs, "--cache-dir", cacheDir)
-			if tc.withImageSubcommand {
-				trivyArgs = append(trivyArgs, "image")
+			osArgs := []string{
+				"image",
+				imageName,
+				"--cache-dir",
+				cacheDir,
+				"--quiet",
+				"--skip-db-update",
+				"--format=json",
+				"--list-all-pkgs=false",
+				"--image-src=docker",
 			}
 
-			trivyArgs = append(trivyArgs, []string{"--skip-update", "--format=json", "--output", of.Name()}...)
-
-			if tc.ignoreUnfixed {
-				trivyArgs = append(trivyArgs, "--ignore-unfixed")
+			if tt.ignoreUnfixed {
+				osArgs = append(osArgs, "--ignore-unfixed")
 			}
-			if len(tc.severity) != 0 {
-				trivyArgs = append(trivyArgs,
-					[]string{"--severity", strings.Join(tc.severity, ",")}...,
+
+			if len(tt.ignoreStatus) != 0 {
+				osArgs = append(osArgs,
+					[]string{
+						"--ignore-status",
+						strings.Join(tt.ignoreStatus, ","),
+					}...,
 				)
 			}
-			if len(tc.ignoreIDs) != 0 {
+			if len(tt.severity) != 0 {
+				osArgs = append(osArgs,
+					[]string{
+						"--severity",
+						strings.Join(tt.severity, ","),
+					}...,
+				)
+			}
+			if len(tt.ignoreIDs) != 0 {
 				trivyIgnore := ".trivyignore"
-				err := ioutil.WriteFile(trivyIgnore, []byte(strings.Join(tc.ignoreIDs, "\n")), 0444)
-				assert.NoError(t, err, "failed to write .trivyignore")
+				err := os.WriteFile(trivyIgnore, []byte(strings.Join(tt.ignoreIDs, "\n")), 0o444)
+				require.NoError(t, err, "failed to write .trivyignore")
 				defer os.Remove(trivyIgnore)
 			}
-			trivyArgs = append(trivyArgs, tc.testfile)
 
-			err = app.Run(trivyArgs)
-			switch {
-			case tc.expectedError != "":
-				require.NotNil(t, err)
-				assert.Contains(t, err.Error(), tc.expectedError, tc.name)
-				return
-			default:
-				assert.NoError(t, err, tc.name)
+			if tt.maxImageSize != "" {
+				osArgs = append(osArgs, []string{
+					"--max-image-size",
+					tt.maxImageSize,
+				}...)
 			}
 
-			// check for vulnerability output info
-			got, err := ioutil.ReadAll(of)
-			assert.NoError(t, err, tc.name)
-			want, err := ioutil.ReadFile(tc.expectedOutputFile)
-			assert.NoError(t, err, tc.name)
-			assert.JSONEq(t, string(want), string(got), tc.name)
+			// Run Trivy
+			runTest(t, osArgs, tt.golden, types.FormatJSON, runOptions{
+				wantErr:  tt.wantErr,
+				fakeUUID: "3ff14136-e09f-4df9-80ea-%012d",
+				// Image config fields were removed
+				override: overrideFuncs(overrideUID, overrideFingerprint, overrideDockerRemovedFields, func(t *testing.T, want, got *types.Report) {
+					// Override ArtifactName to match the archive file path
+					got.ArtifactName = tt.input
 
-			// cleanup
-			_, err = cli.ImageRemove(ctx, tc.testfile, types.ImageRemoveOptions{
-				Force:         true,
-				PruneChildren: true,
+					// Override Result.Target for each result to match golden file expectations
+					require.Len(t, got.Results, len(want.Results))
+					for i := range got.Results {
+						got.Results[i].Target = want.Results[i].Target
+					}
+
+					// Docker API v0.29.0+ calculates the imageID digest based on the manifest, rather than the config file.
+					want.ArtifactID = tt.override.artifactID
+					want.Metadata.ImageID = tt.override.imageID
+				}),
 			})
-			_, err = cli.ImageRemove(ctx, tc.imageTag, types.ImageRemoveOptions{
-				Force:         true,
-				PruneChildren: true,
-			})
-			assert.NoError(t, err, tc.name)
 		})
 	}
 }
